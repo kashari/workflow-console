@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import ELK from "elkjs/lib/elk.bundled.js";
+import ELK from "elkjs/lib/elk-api.js";
+import ELKWorker from "elkjs/lib/elk-worker.js?worker";
 
-const elk = new ELK();
+const elk = new ELK({ workerFactory: () => new ELKWorker() });
 
 /* ================================================================== *
  *  WorkflowGraphWebGL  — WebGL (three.js) state-machine visualizer
@@ -295,18 +296,27 @@ const ELK_OPTS = {
   "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
   "elk.layered.mergeEdges": "false",
 };
+const ELK_OPTS_LARGE = {
+  ...ELK_OPTS,
+  "elk.layered.nodePlacement.strategy": "LINEAR_SEGMENTS",
+  "elk.layered.crossingMinimization.strategy": "GREEDY",
+  "elk.layered.crossingMinimization.semiInteractive": "false",
+  "elk.layered.considerModelOrder.strategy": "NONE",
+};
 async function layoutGraph(nodes, edges) {
+  const large = nodes.length > 300;
   const g = {
     id: "root",
-    layoutOptions: ELK_OPTS,
+    layoutOptions: large ? ELK_OPTS_LARGE : ELK_OPTS,
     children: nodes.map((n) => ({ id: n.id, width: n._sz.w, height: n._sz.h })),
     edges: edges.map((e) => ({ id: e.id, sources: [e.source], targets: [e.target] })),
   };
   const res = await elk.layout(g);
   const cpos = new Map((res.children || []).map((c) => [c.id, c]));
   for (const n of nodes) { const c = cpos.get(n.id); if (c) { n.x = c.x + n._sz.w / 2; n.y = c.y + n._sz.h / 2; } }
+  const resEdgeMap = new Map((res.edges || []).map((re) => [re.id, re]));
   for (const e of edges) {
-    const re = (res.edges || []).find((x) => x.id === e.id);
+    const re = resEdgeMap.get(e.id);
     if (re && re.sections && re.sections.length) {
       const s = re.sections[0];
       const pts = [[s.startPoint.x, s.startPoint.y], ...(s.bendPoints || []).map((p) => [p.x, p.y]), [s.endPoint.x, s.endPoint.y]];
@@ -369,9 +379,10 @@ const PAPER_MM = { A4: [210, 297], A3: [297, 420], A5: [148, 210], Letter: [215.
 
 function buildDiagramSVG(nodes, edges, th, { pad = 48, dpr = 4 } = {}) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
   const routes = [];
   for (const e of edges) {
-    const a = nodes.find((n) => n.id === e.source), b = nodes.find((n) => n.id === e.target);
+    const a = nodeById.get(e.source), b = nodeById.get(e.target);
     if (!a || !b) continue;
     const pts = e._route || simpleRoute(a, b); routes.push(pts);
     for (const [x, y] of pts) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
@@ -542,7 +553,7 @@ export default function WorkflowGraphWebGL() {
     camera.position.z = 10;
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setSize(W, H); renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.setSize(W, H); renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(renderer.domElement);
     const group = new THREE.Group(); scene.add(group);
     const disposables = [];
@@ -576,10 +587,10 @@ export default function WorkflowGraphWebGL() {
           const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
           const pts = e._route || simpleRoute(a, b);
           const rv = ribbon(pts, 0.7, -1), es = eP.length / 3;
-          eP.push(...rv); for (let i = 0; i < rv.length / 3; i++) eC.push(baseE.r, baseE.g, baseE.b);
+          Array.prototype.push.apply(eP, rv); for (let i = 0; i < rv.length / 3; i++) eC.push(baseE.r, baseE.g, baseE.b);
           eRange.set(e.id, [es, rv.length / 3]);
           const av = arrow(pts, 7, -0.5), as = aP.length / 3;
-          aP.push(...av); for (let i = 0; i < av.length / 3; i++) aC.push(baseA.r, baseA.g, baseA.b);
+          Array.prototype.push.apply(aP, av); for (let i = 0; i < av.length / 3; i++) aC.push(baseA.r, baseA.g, baseA.b);
           aRange.set(e.id, [as, av.length / 3]);
         }
         if (eMesh) { group.remove(eMesh); eGeo.dispose(); }
@@ -609,16 +620,23 @@ export default function WorkflowGraphWebGL() {
       }
 
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, initNode = null;
-      for (const n of nodes) {
-        const tex = new THREE.CanvasTexture(drawNode(n, n._sz, th));
-        tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.encoding = THREE.sRGBEncoding;
-        const geo = new THREE.PlaneGeometry(n._sz.w, n._sz.h);
-        const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
-        mesh.position.set(n.x, -n.y, 0); mesh.userData.nodeId = n.id; mesh.userData.node = n;
-        group.add(mesh); nodeMeshes.push(mesh); disposables.push(tex, geo, mesh.material);
-        if (n.id === initial) initNode = n;
-        minX = Math.min(minX, n.x - n._sz.w / 2); maxX = Math.max(maxX, n.x + n._sz.w / 2);
-        minY = Math.min(minY, n.y - n._sz.h / 2); maxY = Math.max(maxY, n.y + n._sz.h / 2);
+      const CHUNK = 50;
+      for (let ci = 0; ci < nodes.length; ci += CHUNK) {
+        if (cancelled) return;
+        const end = Math.min(ci + CHUNK, nodes.length);
+        for (let ni = ci; ni < end; ni++) {
+          const n = nodes[ni];
+          const tex = new THREE.CanvasTexture(drawNode(n, n._sz, th));
+          tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.colorSpace = THREE.SRGBColorSpace;
+          const geo = new THREE.PlaneGeometry(n._sz.w, n._sz.h);
+          const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+          mesh.position.set(n.x, -n.y, 0); mesh.userData.nodeId = n.id; mesh.userData.node = n;
+          group.add(mesh); nodeMeshes.push(mesh); disposables.push(tex, geo, mesh.material);
+          if (n.id === initial) initNode = n;
+          minX = Math.min(minX, n.x - n._sz.w / 2); maxX = Math.max(maxX, n.x + n._sz.w / 2);
+          minY = Math.min(minY, n.y - n._sz.h / 2); maxY = Math.max(maxY, n.y + n._sz.h / 2);
+        }
+        if (end < nodes.length) await new Promise((r) => setTimeout(r, 0));
       }
       buildEdges();
       if (!isFinite(minX)) { minX = -100; maxX = 100; minY = -100; maxY = 100; }
