@@ -1,9 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import ELK from "elkjs/lib/elk-api.js";
-import ELKWorker from "elkjs/lib/elk-worker.js?worker";
+import ELK from "elkjs/lib/elk.bundled.js";
 
-const elk = new ELK({ workerFactory: () => new ELKWorker() });
+const elk = new ELK();
 
 /* ================================================================== *
  *  WorkflowGraphWebGL  — WebGL (three.js) state-machine visualizer
@@ -118,7 +117,6 @@ function buildGraph(wf) {
       endStatus: endSet.has(s.id) ? endNature(s.id, s) : null,
       hasBullet: !!s.microfrontendBullet,
       renderKind: cat === "fork" || cat === "join" ? "bar" : cat === "choice" ? "diamond" : "box",
-      raw: s,
     });
   }
   let tc = 0;
@@ -190,9 +188,12 @@ function boxStyle(node, th) {
 }
 function trunc(ctx, label, max) {
   if (ctx.measureText(label).width <= max) return label;
-  let s = label;
-  while (s.length > 1 && ctx.measureText(s + "\u2026").width > max) s = s.slice(0, -1);
-  return s + "\u2026";
+  let lo = 0, hi = label.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ctx.measureText(label.slice(0, mid) + "\u2026").width <= max) lo = mid; else hi = mid - 1;
+  }
+  return label.slice(0, lo) + "\u2026";
 }
 function drawNode(node, sz, th, dpr = DPR_DRAW) {
   const cv = document.createElement("canvas");
@@ -298,13 +299,15 @@ const ELK_OPTS = {
 };
 const ELK_OPTS_LARGE = {
   ...ELK_OPTS,
+  "elk.edgeRouting": "POLYLINE",
   "elk.layered.nodePlacement.strategy": "LINEAR_SEGMENTS",
   "elk.layered.crossingMinimization.strategy": "GREEDY",
   "elk.layered.crossingMinimization.semiInteractive": "false",
   "elk.layered.considerModelOrder.strategy": "NONE",
+  "elk.layered.mergeEdges": "true",
 };
 async function layoutGraph(nodes, edges) {
-  const large = nodes.length > 300;
+  const large = nodes.length > 150;
   const g = {
     id: "root",
     layoutOptions: large ? ELK_OPTS_LARGE : ELK_OPTS,
@@ -361,9 +364,12 @@ function arrow(pts, sz, z) {
   const nx = -dy, ny = dx;
   return [x2, -y2, z, (x2 - dx * sz) + nx * sz * 0.55, -((y2 - dy * sz) + ny * sz * 0.55), z, (x2 - dx * sz) - nx * sz * 0.55, -((y2 - dy * sz) - ny * sz * 0.55), z];
 }
-function forwardClosure(start, edges) {
+function buildAdj(edges) {
   const adj = new Map();
   for (const e of edges) (adj.get(e.source) || adj.set(e.source, []).get(e.source)).push(e);
+  return adj;
+}
+function forwardClosure(start, adj) {
   const nodeSet = new Set([start]), edgeSet = new Set(), q = [start];
   while (q.length) { const c = q.shift(); for (const e of adj.get(c) || []) { edgeSet.add(e.id); if (!nodeSet.has(e.target)) { nodeSet.add(e.target); q.push(e.target); } } }
   return { nodeSet, edgeSet };
@@ -574,6 +580,7 @@ export default function WorkflowGraphWebGL() {
       const id2 = new Map(nodes.map((n) => [n.id, n]));
       const incidence = new Map(nodes.map((n) => [n.id, []]));
       for (const e of edges) { incidence.get(e.source)?.push(e); incidence.get(e.target)?.push(e); }
+      const adj = buildAdj(edges);
       const reroute = (id) => { for (const e of incidence.get(id) || []) { const a = id2.get(e.source), b = id2.get(e.target); if (a && b) e._route = simpleRoute(a, b); } };
       // apply any manual positions kept from before, rerouting their edges
       for (const n of nodes) { const p = manualPos.current.get(n.id); if (p) { n.x = p.x; n.y = p.y; reroute(n.id); } }
@@ -618,6 +625,20 @@ export default function WorkflowGraphWebGL() {
         nodeMeshes.forEach((mm) => { mm.material.opacity = !cl || cl.nodeSet.has(mm.userData.nodeId) ? 1 : 0.2; });
         S.current.dirty = true;
       }
+      function patchEdges(incidentEdges) {
+        const ePos = eGeo.attributes.position, aPos = aGeo.attributes.position;
+        for (const e of incidentEdges) {
+          const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
+          const pts = e._route || simpleRoute(a, b);
+          const rv = ribbon(pts, 0.7, -1), er = eRange.get(e.id);
+          if (!er || rv.length / 3 !== er[1]) { buildEdges(); return; }
+          for (let i = 0, k = er[0]; i < rv.length; i += 3, k++) ePos.setXYZ(k, rv[i], rv[i + 1], rv[i + 2]);
+          const av = arrow(pts, 7, -0.5), ar = aRange.get(e.id);
+          if (!ar || av.length / 3 !== ar[1]) { buildEdges(); return; }
+          for (let i = 0, k = ar[0]; i < av.length; i += 3, k++) aPos.setXYZ(k, av[i], av[i + 1], av[i + 2]);
+        }
+        ePos.needsUpdate = true; aPos.needsUpdate = true;
+      }
 
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, initNode = null;
       const CHUNK = 50;
@@ -643,7 +664,7 @@ export default function WorkflowGraphWebGL() {
 
       const st = S.current;
       st.cur = st.cur || { x: 0, y: 0, zoom: 1 };
-      st.targetZoom = st.cur.zoom; st.focal = null; st.vel = { x: 0, y: 0 }; st.mode = null; st.dirty = true; st.edgesDirty = false;
+      st.targetZoom = st.cur.zoom; st.focal = null; st.vel = { x: 0, y: 0 }; st.mode = null; st.dirty = true;
       const apply = () => { camera.zoom = st.cur.zoom; camera.position.set(st.cur.x, st.cur.y, 10); camera.updateProjectionMatrix(); };
       if (!st.initialized) {
         if (initNode) { st.cur.zoom = 1.15; st.targetZoom = 1.15; st.cur.x = initNode.x + (W * 0.2) / 1.15; st.cur.y = -initNode.y; }
@@ -659,17 +680,17 @@ export default function WorkflowGraphWebGL() {
           if (st.focal) { st.cur.x = st.focal.wx - st.focal.mx / st.cur.zoom; st.cur.y = st.focal.wy + st.focal.my / st.cur.zoom; }
         } else { st.cur.zoom = st.targetZoom; st.focal = null; }
         if (st.mode !== "pan" && (Math.abs(st.vel.x) > 0.02 || Math.abs(st.vel.y) > 0.02)) { st.cur.x -= st.vel.x; st.cur.y += st.vel.y; st.vel.x *= 0.9; st.vel.y *= 0.9; moved = true; }
-        if (st.edgesDirty) { buildEdges(); st.edgesDirty = false; moved = true; }
         if (moved || st.dirty) { apply(); renderer.render(scene, camera); st.dirty = false; }
         raf = requestAnimationFrame(loop);
       };
       raf = requestAnimationFrame(loop);
 
       let lastX = 0, lastY = 0, isDown = false, movedAmt = 0, dragMesh = null;
+      const rc = new THREE.Raycaster();
       const pick = (e) => {
         const rect = renderer.domElement.getBoundingClientRect();
         const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
-        const rc = new THREE.Raycaster(); rc.setFromCamera(ndc, camera);
+        rc.setFromCamera(ndc, camera);
         return rc.intersectObjects(nodeMeshes)[0]?.object || null;
       };
       const onDown = (e) => { isDown = true; lastX = e.clientX; lastY = e.clientY; movedAmt = 0; st.vel = { x: 0, y: 0 }; dragMesh = pick(e); st.mode = dragMesh ? "node" : "pan"; container.style.cursor = "grabbing"; };
@@ -682,7 +703,8 @@ export default function WorkflowGraphWebGL() {
           dragMesh.position.set(n.x, -n.y, 0);
           manualPos.current.set(n.id, { x: n.x, y: n.y });
           reroute(n.id);
-          st.edgesDirty = true; st.dirty = true;
+          patchEdges(incidence.get(n.id) || []);
+          st.dirty = true;
         } else {
           st.cur.x -= dx / st.cur.zoom; st.cur.y += dy / st.cur.zoom; st.vel = { x: dx / st.cur.zoom, y: dy / st.cur.zoom }; st.dirty = true;
         }
@@ -690,7 +712,7 @@ export default function WorkflowGraphWebGL() {
       };
       const onUp = () => {
         if (isDown && movedAmt < 5) {
-          if (dragMesh) { const id = dragMesh.userData.nodeId; applyHighlight(forwardClosure(id, edges)); setSelected(id2.get(id)?.label || id); }
+          if (dragMesh) { const id = dragMesh.userData.nodeId; applyHighlight(forwardClosure(id, adj)); setSelected(id2.get(id)?.label || id); }
           else { applyHighlight(null); setSelected(null); }
         }
         isDown = false; dragMesh = null; st.mode = null; container.style.cursor = "grab";
