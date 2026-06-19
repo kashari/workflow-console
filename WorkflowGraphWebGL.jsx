@@ -306,11 +306,42 @@ const ELK_OPTS_LARGE = {
   "elk.layered.considerModelOrder.strategy": "NONE",
   "elk.layered.mergeEdges": "true",
 };
+/* Fast BFS hierarchical layout — O(V+E), no recursion, handles cycles.
+ * Used automatically when the graph is too large for ELK, and as a
+ * guaranteed fallback if ELK throws any error. */
+function fallbackLayout(nodes, edges) {
+  const out = new Map(nodes.map((n) => [n.id, []]));
+  for (const e of edges) out.get(e.source)?.push(e.target);
+  const hasPred = new Set(edges.map((e) => e.target));
+  const layer = new Map();
+  const q = [];
+  for (const n of nodes) if (!hasPred.has(n.id)) { layer.set(n.id, 0); q.push(n.id); }
+  if (!q.length && nodes.length) { layer.set(nodes[0].id, 0); q.push(nodes[0].id); }
+  while (q.length) {
+    const id = q.shift(), l = layer.get(id);
+    for (const tid of out.get(id) || []) if (!layer.has(tid)) { layer.set(tid, l + 1); q.push(tid); }
+  }
+  let maxL = 0;
+  for (const [, l] of layer) if (l > maxL) maxL = l;
+  for (const n of nodes) if (!layer.has(n.id)) layer.set(n.id, ++maxL);
+  const byLayer = [];
+  for (const n of nodes) { const l = layer.get(n.id); while (byLayer.length <= l) byLayer.push([]); byLayer[l].push(n); }
+  const COL_GAP = 80, ROW_GAP = 36;
+  let cx = 0;
+  for (const ns of byLayer) {
+    const maxW = ns.reduce((m, n) => Math.max(m, n._sz.w), 0);
+    const totalH = ns.reduce((s, n) => s + n._sz.h, 0) + ROW_GAP * (ns.length - 1);
+    let y = -totalH / 2;
+    for (const n of ns) { n.x = cx + maxW / 2; n.y = y + n._sz.h / 2; y += n._sz.h + ROW_GAP; }
+    cx += maxW + COL_GAP;
+  }
+  for (const e of edges) e._route = null;
+}
 async function layoutGraph(nodes, edges) {
-  const large = nodes.length > 150;
+  if (nodes.length > 150) { fallbackLayout(nodes, edges); return; }
   const g = {
     id: "root",
-    layoutOptions: large ? ELK_OPTS_LARGE : ELK_OPTS,
+    layoutOptions: nodes.length > 60 ? ELK_OPTS_LARGE : ELK_OPTS,
     children: nodes.map((n) => ({ id: n.id, width: n._sz.w, height: n._sz.h })),
     edges: edges.map((e) => ({ id: e.id, sources: [e.source], targets: [e.target] })),
   };
@@ -322,8 +353,7 @@ async function layoutGraph(nodes, edges) {
     const re = resEdgeMap.get(e.id);
     if (re && re.sections && re.sections.length) {
       const s = re.sections[0];
-      const pts = [[s.startPoint.x, s.startPoint.y], ...(s.bendPoints || []).map((p) => [p.x, p.y]), [s.endPoint.x, s.endPoint.y]];
-      e._route = round(pts, 8);
+      e._route = round([[s.startPoint.x, s.startPoint.y], ...(s.bendPoints || []).map((p) => [p.x, p.y]), [s.endPoint.x, s.endPoint.y]], 8);
     } else e._route = null;
   }
 }
@@ -406,10 +436,10 @@ function buildDiagramSVG(nodes, edges, th, { pad = 48, dpr = 4 } = {}) {
   parts.push(`<rect x="0" y="0" width="${W}" height="${H}" fill="${th.bg}"/>`);
   for (const pts of routes) {
     const d = pts.map(([x, y], i) => `${i ? "L" : "M"}${(x + ox).toFixed(1)} ${(y + oy).toFixed(1)}`).join(" ");
-    parts.push(`<path d="${d}" fill="none" stroke="${th.edge}" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" opacity="0.95"/>`);
+    parts.push(`<path d="${d}" fill="none" stroke="${th.edge}" stroke-width="2.0" stroke-linejoin="round" stroke-linecap="round" opacity="0.95"/>`);
     const [x2, y2] = pts[pts.length - 1], [x1, y1] = pts[pts.length - 2];
     let dx = x2 - x1, dy = y2 - y1; const L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
-    const nx = -dy, ny = dx, s = 7;
+    const nx = -dy, ny = dx, s = 11;
     const tipX = x2 + ox, tipY = y2 + oy;
     const p1x = (x2 - dx * s) + nx * s * 0.55 + ox, p1y = (y2 - dy * s) + ny * s * 0.55 + oy;
     const p2x = (x2 - dx * s) - nx * s * 0.55 + ox, p2y = (y2 - dy * s) - ny * s * 0.55 + oy;
@@ -574,7 +604,7 @@ export default function WorkflowGraphWebGL() {
       const m = mctx();
       nodes.forEach((n) => (n._sz = nodeSize(n, m)));
 
-      try { await layoutGraph(nodes, edges); } catch (e) { setErrors((p) => [...p, "Layout failed: " + (e?.message || e)]); }
+      try { await layoutGraph(nodes, edges); } catch (e) { fallbackLayout(nodes, edges); setErrors((p) => [...p, "ELK failed, auto-layout used: " + (e?.message || e)]); }
       if (cancelled) return;
 
       const id2 = new Map(nodes.map((n) => [n.id, n]));
@@ -593,10 +623,10 @@ export default function WorkflowGraphWebGL() {
         for (const e of edges) {
           const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
           const pts = e._route || simpleRoute(a, b);
-          const rv = ribbon(pts, 0.7, -1), es = eP.length / 3;
+          const rv = ribbon(pts, 1.1, -1), es = eP.length / 3;
           Array.prototype.push.apply(eP, rv); for (let i = 0; i < rv.length / 3; i++) eC.push(baseE.r, baseE.g, baseE.b);
           eRange.set(e.id, [es, rv.length / 3]);
-          const av = arrow(pts, 7, -0.5), as = aP.length / 3;
+          const av = arrow(pts, 14, -0.5), as = aP.length / 3;
           Array.prototype.push.apply(aP, av); for (let i = 0; i < av.length / 3; i++) aC.push(baseA.r, baseA.g, baseA.b);
           aRange.set(e.id, [as, av.length / 3]);
         }
@@ -630,10 +660,10 @@ export default function WorkflowGraphWebGL() {
         for (const e of incidentEdges) {
           const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
           const pts = e._route || simpleRoute(a, b);
-          const rv = ribbon(pts, 0.7, -1), er = eRange.get(e.id);
+          const rv = ribbon(pts, 1.1, -1), er = eRange.get(e.id);
           if (!er || rv.length / 3 !== er[1]) { buildEdges(); return; }
           for (let i = 0, k = er[0]; i < rv.length; i += 3, k++) ePos.setXYZ(k, rv[i], rv[i + 1], rv[i + 2]);
-          const av = arrow(pts, 7, -0.5), ar = aRange.get(e.id);
+          const av = arrow(pts, 14, -0.5), ar = aRange.get(e.id);
           if (!ar || av.length / 3 !== ar[1]) { buildEdges(); return; }
           for (let i = 0, k = ar[0]; i < av.length; i += 3, k++) aPos.setXYZ(k, av[i], av[i + 1], av[i + 2]);
         }
