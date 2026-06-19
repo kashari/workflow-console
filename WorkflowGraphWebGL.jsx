@@ -804,7 +804,7 @@ export default function WorkflowGraphWebGL() {
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100vh", background: th.bg, fontFamily: FONT_STACK, overflow: "hidden" }}>
-      <div style={{ height: 30, background: th.headerRed, color: "#fff", display: "flex", alignItems: "center", padding: "0 14px", fontSize: 12, fontWeight: 700, letterSpacing: 0.3 }}>Values.workflow.work…</div>
+      <div style={{ height: 30, background: th.headerRed, color: "#fff", display: "flex", alignItems: "center", padding: "0 14px", fontSize: 12, fontWeight: 700, letterSpacing: 0.3 }}>STATE MACHINE ANALYZER v1.0.0</div>
 
       <div style={{ position: "absolute", top: 40, right: 12, zIndex: 5, display: "flex", gap: 6, alignItems: "center" }}>
         <button onClick={() => setThemeName((t) => (t === "light" ? "dark" : "light"))}
