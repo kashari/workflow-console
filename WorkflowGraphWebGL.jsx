@@ -51,7 +51,8 @@ const FONT_BADGE = `700 10px ${FONT_STACK}`;
 const FONT_FORK = `700 11px ${FONT_STACK}`;
 const NODE_H = 46, PAD_X = 14, GAP = 10, BADGE_PAD = 8, MAX_LABEL_W = 152;
 const COL_GAP = 74, ROW_GAP = 32;
-const BAR_W = 18, BAR_H = 58, DIA = 44;
+const BAR_LEN = 58, BAR_THK = 18, DIA = 44; // fork/join: horizontal bar (length x thickness)
+const PILL_W = 26, PILL_H = 16; // compact event/transition pill
 
 /* --------------------------- SAMPLE JSON --------------------------- */
 const SAMPLE = {
@@ -126,7 +127,7 @@ function buildGraph(wf) {
     if (!okT) errors.push(`Unknown target "${target}" (event ${event}) — transition skipped`);
     if (!okS || !okT) return;
     const id = `__t${tc++}__${event}`;
-    nodes.push({ id, kind: "transition", label: String(event), badge: "External", cat: "transition", renderKind: "box" });
+    nodes.push({ id, kind: "transition", label: String(event), badge: "External", cat: "transition", renderKind: "pill" });
     edges.push({ id: id + "-in", source, target: id });
     edges.push({ id: id + "-out", source: id, target });
   };
@@ -163,11 +164,14 @@ function spartanLambda(ctx, cx, cy, h, color) {
 function nodeSize(node, m) {
   m.font = node.renderKind === "bar" ? FONT_FORK : FONT_LABEL;
   const rawLabelW = m.measureText(node.label).width;
+  if (node.renderKind === "pill") {
+    return { kind: "pill", w: PILL_W, h: PILL_H, labelW: Math.min(rawLabelW, MAX_LABEL_W), anchorW: PILL_W, anchorH: PILL_H, ay: 0 };
+  }
   if (node.renderKind === "bar") {
-    const labelW = Math.min(rawLabelW, 120);
-    const w = Math.ceil(Math.max(BAR_W, labelW) + 10);
-    const h = BAR_H + 6 + 15;
-    return { kind: "bar", w, h, labelW, anchorW: BAR_W, anchorH: BAR_H, ay: BAR_H / 2 + 2 - h / 2 };
+    const labelW = Math.min(rawLabelW, 140);
+    const w = Math.ceil(Math.max(BAR_LEN, labelW) + 10);
+    const h = BAR_THK + 6 + 15;
+    return { kind: "bar", w, h, labelW, anchorW: BAR_LEN, anchorH: BAR_THK, ay: BAR_THK / 2 + 2 - h / 2 };
   }
   const labelW = Math.min(rawLabelW, MAX_LABEL_W);
   m.font = FONT_BADGE;
@@ -201,13 +205,18 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
   const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr); ctx.textBaseline = "middle";
   const { w, h } = sz;
 
+  if (sz.kind === "pill") {
+    rr(ctx, 1, 1, w - 2, h - 2, (h - 2) / 2); ctx.fillStyle = th.transFill; ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = th.transBorder; ctx.stroke();
+    return cv;
+  }
   if (sz.kind === "bar") {
-    const bx = (w - BAR_W) / 2;
-    rr(ctx, bx, 2, BAR_W, BAR_H, 6); ctx.fillStyle = th.forkBar; ctx.fill();
-    if (node.cat === "join") spartanLambda(ctx, w / 2, 2 + BAR_H / 2, 28, th.forkIcon);
-    else cutleryFork(ctx, w / 2, 2 + BAR_H / 2, 30, th.forkIcon);
+    const bx = (w - BAR_LEN) / 2;
+    rr(ctx, bx, 2, BAR_LEN, BAR_THK, 6); ctx.fillStyle = th.forkBar; ctx.fill();
+    if (node.cat === "join") spartanLambda(ctx, w / 2, 2 + BAR_THK / 2, 13, th.forkIcon);
+    else cutleryFork(ctx, w / 2, 2 + BAR_THK / 2, 13, th.forkIcon);
     ctx.font = FONT_FORK; ctx.fillStyle = th.forkText; ctx.textAlign = "center";
-    ctx.fillText(trunc(ctx, node.label, w - 4), w / 2, BAR_H + 6 + 7);
+    ctx.fillText(trunc(ctx, node.label, w - 4), w / 2, BAR_THK + 6 + 7);
     ctx.textAlign = "left";
     return cv;
   }
@@ -260,9 +269,11 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
       ctx.fillStyle = th.initial; ctx.beginPath(); ctx.arc(cx + 8, iy, 8, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = th.white; ctx.beginPath(); ctx.moveTo(cx + 5.5, iy - 4); ctx.lineTo(cx + 12, iy); ctx.lineTo(cx + 5.5, iy + 4); ctx.closePath(); ctx.fill();
     } else if (node.hasBullet) {
-      rr(ctx, cx, iy - 8, 16, 16, 4); ctx.fillStyle = th.bullet; ctx.fill();
-      ctx.strokeStyle = th.white; ctx.lineWidth = 1.9; ctx.beginPath();
-      ctx.moveTo(cx + 3.5, iy + 0.5); ctx.lineTo(cx + 7, iy + 4); ctx.lineTo(cx + 12.5, iy - 3.5); ctx.stroke();
+      // microfrontend bullet: filled dot inside a thin ring (distinct from end-state ✓/✕)
+      ctx.beginPath(); ctx.arc(cx + 8, iy, 8, 0, Math.PI * 2);
+      ctx.lineWidth = 1.6; ctx.strokeStyle = th.bullet; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx + 8, iy, 4, 0, Math.PI * 2);
+      ctx.fillStyle = th.bullet; ctx.fill();
     }
     cx += 28;
   }
@@ -275,6 +286,22 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
   return cv;
 }
 
+/* Floating event label for a transition pill — drawn above the pill and shown
+ * only while the pill is in the active focus set (keeps the tree uncluttered). */
+function drawPillLabel(text, th, dpr = DPR_DRAW) {
+  const m = mctx(); m.font = FONT_BADGE;
+  const tw = Math.min(m.measureText(String(text)).width, MAX_LABEL_W);
+  const padX = 7, h = 18, w = Math.ceil(tw + padX * 2);
+  const cv = document.createElement("canvas");
+  cv.width = Math.ceil(w * dpr); cv.height = Math.ceil(h * dpr);
+  const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr); ctx.textBaseline = "middle";
+  rr(ctx, 0.5, 0.5, w - 1, h - 1, h / 2); ctx.fillStyle = th.transBadgeFill; ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = th.transBorder; ctx.stroke();
+  ctx.font = FONT_BADGE; ctx.fillStyle = th.transBadgeText; ctx.textAlign = "center";
+  ctx.fillText(trunc(ctx, String(text), tw), w / 2, h / 2 + 0.5);
+  return { cv, w, h };
+}
+
 /* ------------------------ ELK layered layout ---------------------- *
  *  ELK computes both node placement (crossing-minimised) and clean
  *  orthogonal edge routing through reserved channels, so long edges no
@@ -283,7 +310,7 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
  * ------------------------------------------------------------------ */
 const ELK_OPTS = {
   "elk.algorithm": "layered",
-  "elk.direction": "RIGHT",
+  "elk.direction": "DOWN",
   "elk.edgeRouting": "ORTHOGONAL",
   "elk.layered.spacing.nodeNodeBetweenLayers": "78",
   "elk.spacing.nodeNode": "46",
@@ -326,14 +353,15 @@ function fallbackLayout(nodes, edges) {
   for (const n of nodes) if (!layer.has(n.id)) layer.set(n.id, ++maxL);
   const byLayer = [];
   for (const n of nodes) { const l = layer.get(n.id); while (byLayer.length <= l) byLayer.push([]); byLayer[l].push(n); }
-  const COL_GAP = 80, ROW_GAP = 36;
-  let cx = 0;
+  // top-to-bottom: each layer is a horizontal row, layers stack downward
+  const LAYER_GAP = 80, SIB_GAP = 40;
+  let cy = 0;
   for (const ns of byLayer) {
-    const maxW = ns.reduce((m, n) => Math.max(m, n._sz.w), 0);
-    const totalH = ns.reduce((s, n) => s + n._sz.h, 0) + ROW_GAP * (ns.length - 1);
-    let y = -totalH / 2;
-    for (const n of ns) { n.x = cx + maxW / 2; n.y = y + n._sz.h / 2; y += n._sz.h + ROW_GAP; }
-    cx += maxW + COL_GAP;
+    const maxH = ns.reduce((m, n) => Math.max(m, n._sz.h), 0);
+    const totalW = ns.reduce((s, n) => s + n._sz.w, 0) + SIB_GAP * (ns.length - 1);
+    let x = -totalW / 2;
+    for (const n of ns) { n.y = cy + maxH / 2; n.x = x + n._sz.w / 2; x += n._sz.w + SIB_GAP; }
+    cy += maxH + LAYER_GAP;
   }
   for (const e of edges) e._route = null;
 }
@@ -357,12 +385,13 @@ async function layoutGraph(nodes, edges) {
     } else e._route = null;
   }
 }
-/* lightweight reroute used only while a node is being dragged */
+/* lightweight reroute used only while a node is being dragged (top-to-bottom flow:
+ * exit the bottom of the source, enter the top of the target, with a vertical S-bend) */
 function simpleRoute(a, b) {
-  const ax = a.x + a._sz.anchorW / 2, ay = a.y, bx = b.x - b._sz.anchorW / 2, by = b.y;
-  if (bx > ax + 26) { const mx = (ax + bx) / 2; return round([[ax, ay], [mx, ay], [mx, by], [bx, by]], 8); }
-  const ly = Math.max(ay, by) + a._sz.h / 2 + 34;
-  return round([[ax, ay], [ax + 20, ay], [ax + 20, ly], [bx - 20, ly], [bx - 20, by], [bx, by]], 8);
+  const ax = a.x, ay = a.y + a._sz.anchorH / 2, bx = b.x, by = b.y - b._sz.anchorH / 2;
+  if (by > ay + 26) { const my = (ay + by) / 2; return round([[ax, ay], [ax, my], [bx, my], [bx, by]], 8); }
+  const lx = Math.max(ax, bx) + a._sz.w / 2 + 34;
+  return round([[ax, ay], [ax, ay + 20], [lx, ay + 20], [lx, by - 20], [bx, by - 20], [bx, by]], 8);
 }
 
 /* --------------------- edge geometry ------------------------------ */
@@ -399,9 +428,15 @@ function buildAdj(edges) {
   for (const e of edges) (adj.get(e.source) || adj.set(e.source, []).get(e.source)).push(e);
   return adj;
 }
-function forwardClosure(start, adj) {
-  const nodeSet = new Set([start]), edgeSet = new Set(), q = [start];
-  while (q.length) { const c = q.shift(); for (const e of adj.get(c) || []) { edgeSet.add(e.id); if (!nodeSet.has(e.target)) { nodeSet.add(e.target); q.push(e.target); } } }
+/* Focus only the *direct next states*: the clicked state, its outgoing transition
+ * pills, and the states those pills lead to (one logical hop = 2 edge levels).
+ * No transitive recursion, so the rest of the graph stays out of the focus set. */
+function directFocus(start, adj) {
+  const nodeSet = new Set([start]), edgeSet = new Set();
+  for (const e of adj.get(start) || []) {
+    edgeSet.add(e.id); nodeSet.add(e.target);
+    for (const e2 of adj.get(e.target) || []) { edgeSet.add(e2.id); nodeSet.add(e2.target); }
+  }
   return { nodeSet, edgeSet };
 }
 
@@ -618,6 +653,20 @@ export default function WorkflowGraphWebGL() {
       let eMesh = null, aMesh = null, eGeo = null, aGeo = null, eRange = new Map(), aRange = new Map();
       const baseE = new THREE.Color(th.edge), baseA = new THREE.Color(th.arrow), HI = new THREE.Color(th.edgeHi), DIM = new THREE.Color(th.edgeDim);
       const nodeMeshes = [];
+      const pillLabels = new Map(); // nodeId -> label mesh (created lazily on first focus)
+      const ensureLabel = (n) => {
+        let mesh = pillLabels.get(n.id);
+        if (mesh) return mesh;
+        const { cv, w, h } = drawPillLabel(n.label, th);
+        const tex = new THREE.CanvasTexture(cv);
+        tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.colorSpace = THREE.SRGBColorSpace;
+        const geo = new THREE.PlaneGeometry(w, h);
+        mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+        mesh.userData.labelH = h; mesh.renderOrder = 2;
+        mesh.position.set(n.x, -n.y + n._sz.h / 2 + 4 + h / 2, 0.5);
+        group.add(mesh); pillLabels.set(n.id, mesh); disposables.push(tex, geo, mesh.material);
+        return mesh;
+      };
       function buildEdges() {
         const eP = [], eC = [], aP = [], aC = []; eRange = new Map(); aRange = new Map();
         for (const e of edges) {
@@ -653,6 +702,9 @@ export default function WorkflowGraphWebGL() {
           setR(aGeo.attributes.color, aRange.get(e.id), cl ? (on ? HI : baseA) : baseA);
         }
         nodeMeshes.forEach((mm) => { mm.material.opacity = !cl || cl.nodeSet.has(mm.userData.nodeId) ? 1 : 0.2; });
+        // event labels: show only for transition pills inside the focus set
+        pillLabels.forEach((mm) => (mm.visible = false));
+        if (cl) for (const nid of cl.nodeSet) { const n = id2.get(nid); if (n && n.renderKind === "pill") ensureLabel(n).visible = true; }
         S.current.dirty = true;
       }
       function patchEdges(incidentEdges) {
@@ -695,21 +747,36 @@ export default function WorkflowGraphWebGL() {
       const st = S.current;
       st.cur = st.cur || { x: 0, y: 0, zoom: 1 };
       st.targetZoom = st.cur.zoom; st.focal = null; st.vel = { x: 0, y: 0 }; st.mode = null; st.dirty = true;
+      st.targetX = st.cur.x; st.targetY = st.cur.y; st.flying = false;
       const apply = () => { camera.zoom = st.cur.zoom; camera.position.set(st.cur.x, st.cur.y, 10); camera.updateProjectionMatrix(); };
       if (!st.initialized) {
-        if (initNode) { st.cur.zoom = 1.15; st.targetZoom = 1.15; st.cur.x = initNode.x + (W * 0.2) / 1.15; st.cur.y = -initNode.y; }
+        if (initNode) { st.cur.zoom = 1.15; st.targetZoom = 1.15; st.cur.x = initNode.x; st.cur.y = -initNode.y - (H * 0.3) / 1.15; }
         else { st.cur.x = (minX + maxX) / 2; st.cur.y = -(minY + maxY) / 2; }
         st.initialized = true;
       }
       apply();
 
+      // viewport culling: skip drawing nodes outside the camera view on large graphs
+      const CULL_MIN = 200;
+      const cull = () => {
+        const halfW = (W / 2) / st.cur.zoom + 48, halfH = (H / 2) / st.cur.zoom + 48;
+        for (const mm of nodeMeshes) {
+          const n = mm.userData.node;
+          mm.visible = Math.abs(n.x - st.cur.x) <= halfW + n._sz.w / 2 && Math.abs(-n.y - st.cur.y) <= halfH + n._sz.h / 2;
+        }
+      };
       const loop = () => {
         let moved = false;
         if (Math.abs(st.cur.zoom - st.targetZoom) > 1e-4) {
           st.cur.zoom += (st.targetZoom - st.cur.zoom) * 0.2; moved = true;
           if (st.focal) { st.cur.x = st.focal.wx - st.focal.mx / st.cur.zoom; st.cur.y = st.focal.wy + st.focal.my / st.cur.zoom; }
         } else { st.cur.zoom = st.targetZoom; st.focal = null; }
-        if (st.mode !== "pan" && (Math.abs(st.vel.x) > 0.02 || Math.abs(st.vel.y) > 0.02)) { st.cur.x -= st.vel.x; st.cur.y += st.vel.y; st.vel.x *= 0.9; st.vel.y *= 0.9; moved = true; }
+        if (st.flying) {
+          st.cur.x += (st.targetX - st.cur.x) * 0.18; st.cur.y += (st.targetY - st.cur.y) * 0.18; moved = true;
+          if (Math.abs(st.targetX - st.cur.x) < 0.4 && Math.abs(st.targetY - st.cur.y) < 0.4 && Math.abs(st.cur.zoom - st.targetZoom) < 1e-3) st.flying = false;
+        }
+        if (!st.flying && st.mode !== "pan" && (Math.abs(st.vel.x) > 0.02 || Math.abs(st.vel.y) > 0.02)) { st.cur.x -= st.vel.x; st.cur.y += st.vel.y; st.vel.x *= 0.9; st.vel.y *= 0.9; moved = true; }
+        if ((moved || st.dirty) && nodes.length > CULL_MIN) cull();
         if (moved || st.dirty) { apply(); renderer.render(scene, camera); st.dirty = false; }
         raf = requestAnimationFrame(loop);
       };
@@ -723,7 +790,7 @@ export default function WorkflowGraphWebGL() {
         rc.setFromCamera(ndc, camera);
         return rc.intersectObjects(nodeMeshes)[0]?.object || null;
       };
-      const onDown = (e) => { isDown = true; lastX = e.clientX; lastY = e.clientY; movedAmt = 0; st.vel = { x: 0, y: 0 }; dragMesh = pick(e); st.mode = dragMesh ? "node" : "pan"; container.style.cursor = "grabbing"; };
+      const onDown = (e) => { isDown = true; lastX = e.clientX; lastY = e.clientY; movedAmt = 0; st.vel = { x: 0, y: 0 }; st.flying = false; dragMesh = pick(e); st.mode = dragMesh ? "node" : "pan"; container.style.cursor = "grabbing"; };
       const onMove = (e) => {
         if (!isDown) return;
         const dx = e.clientX - lastX, dy = e.clientY - lastY; movedAmt += Math.abs(dx) + Math.abs(dy);
@@ -731,6 +798,7 @@ export default function WorkflowGraphWebGL() {
           const n = dragMesh.userData.node;
           n.x += dx / st.cur.zoom; n.y += dy / st.cur.zoom;
           dragMesh.position.set(n.x, -n.y, 0);
+          const lbl = pillLabels.get(n.id); if (lbl) lbl.position.set(n.x, -n.y + n._sz.h / 2 + 4 + lbl.userData.labelH / 2, 0.5);
           manualPos.current.set(n.id, { x: n.x, y: n.y });
           reroute(n.id);
           patchEdges(incidence.get(n.id) || []);
@@ -742,13 +810,14 @@ export default function WorkflowGraphWebGL() {
       };
       const onUp = () => {
         if (isDown && movedAmt < 5) {
-          if (dragMesh) { const id = dragMesh.userData.nodeId; applyHighlight(forwardClosure(id, adj)); setSelected(id2.get(id)?.label || id); }
+          if (dragMesh) { const id = dragMesh.userData.nodeId; const cl = directFocus(id, adj); applyHighlight(cl); st.flyTo(cl.nodeSet); setSelected(id2.get(id)?.label || id); }
           else { applyHighlight(null); setSelected(null); }
         }
         isDown = false; dragMesh = null; st.mode = null; container.style.cursor = "grab";
       };
       const onWheel = (e) => {
         e.preventDefault();
+        st.flying = false;
         const rect = container.getBoundingClientRect();
         const mx = e.clientX - rect.left - rect.width / 2, my = e.clientY - rect.top - rect.height / 2;
         st.focal = { mx, my, wx: st.cur.x + mx / st.cur.zoom, wy: st.cur.y - my / st.cur.zoom };
@@ -773,8 +842,18 @@ export default function WorkflowGraphWebGL() {
       });
       ro.observe(container);
 
-      st.fit = () => { const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.12; st.targetZoom = Math.min(W / (gw * p), H / (gh * p), 1.6); st.focal = null; st.cur.x = (minX + maxX) / 2; st.cur.y = -(minY + maxY) / 2; st.dirty = true; };
-      st.focusStart = () => { if (!initNode) return st.fit(); st.targetZoom = 1.15; st.focal = null; st.cur.x = initNode.x + (W * 0.2) / 1.15; st.cur.y = -initNode.y; st.dirty = true; };
+      st.fit = () => { st.flying = false; const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.12; st.targetZoom = Math.min(W / (gw * p), H / (gh * p), 1.6); st.focal = null; st.cur.x = (minX + maxX) / 2; st.cur.y = -(minY + maxY) / 2; st.dirty = true; };
+      // smoothly center + zoom onto the bounding box of a set of node ids
+      st.flyTo = (set) => {
+        let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
+        for (const nid of set) { const n = id2.get(nid); if (!n) continue; mnx = Math.min(mnx, n.x - n._sz.w / 2); mxx = Math.max(mxx, n.x + n._sz.w / 2); mny = Math.min(mny, n.y - n._sz.h / 2); mxy = Math.max(mxy, n.y + n._sz.h / 2); }
+        if (!isFinite(mnx)) return;
+        const gw = mxx - mnx || 1, gh = mxy - mny || 1, p = 1.6;
+        st.targetZoom = Math.min(Math.max(Math.min(W / (gw * p), H / (gh * p)), 0.35), 2.2);
+        st.targetX = (mnx + mxx) / 2; st.targetY = -(mny + mxy) / 2;
+        st.focal = null; st.vel = { x: 0, y: 0 }; st.flying = true; st.dirty = true;
+      };
+      st.focusStart = () => { if (!initNode) return st.fit(); st.flying = false; st.targetZoom = 1.15; st.focal = null; st.cur.x = initNode.x; st.cur.y = -initNode.y - (H * 0.3) / 1.15; st.dirty = true; };
       st.zoomBy = (f) => { st.targetZoom = Math.min(Math.max(st.targetZoom * f, 0.12), 5); st.focal = null; };
       st.clearSel = () => { applyHighlight(null); setSelected(null); };
       st.resetPos = () => { manualPos.current = new Map(); setGraphData((g) => ({ ...g })); };
@@ -825,7 +904,7 @@ export default function WorkflowGraphWebGL() {
 
       {selected && (
         <div style={{ position: "absolute", top: 80, right: 12, zIndex: 5, background: u.panel, border: `1px solid ${u.border}`, color: u.text, borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-          Forward paths from <b style={{ color: th.edgeHi }}>{selected}</b>
+          Next from <b style={{ color: th.edgeHi }}>{selected}</b>
         </div>
       )}
 
@@ -835,7 +914,8 @@ export default function WorkflowGraphWebGL() {
         <Swatch c={th.endErr} label="End — KO / error (✕)" />
         <Swatch c={th.forkBar} label="Fork / Join (drag to arrange)" />
         <Swatch c={th.choiceAccent} label="Choice" />
-        <Swatch c={th.transFill} label="Transition" />
+        <Swatch c={th.transFill} label="Transition (click a state to reveal)" />
+        <Swatch c={th.bullet} label="MFE bullet (◉)" />
       </div>
 
       {errors.length > 0 && (
