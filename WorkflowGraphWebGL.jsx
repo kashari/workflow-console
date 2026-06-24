@@ -1,13 +1,10 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
-import ELK from "elkjs/lib/elk.bundled.js";
-
-const elk = new ELK();
 
 /* ================================================================== *
- *  WorkflowGraphWebGL  — WebGL (three.js) state-machine visualizer
- *  v3: light/dark themes, draggable nodes, fork/join bars w/ cutlery
- *  icon, choice diamonds, thin modern arrows.
+ *  WorkflowGraphWebGL  — Focused-Explorer state-machine analyzer
+ *  Navigate one state's neighborhood at a time; search/outline to jump;
+ *  common transitions collapse to "globals"; reachability + path tracing.
  * ================================================================== */
 
 /* ----------------------------- THEMES ----------------------------- */
@@ -18,13 +15,13 @@ const LIGHT = {
   stateText: "#1a1a1a", stateBadgeFill: "#e8e5db", stateBadgeText: "#55534b",
   darkFill: "#272d35", darkBorder: "#272d35", darkText: "#f3f5f8",
   darkBadgeFill: "#3a414b", darkBadgeText: "#c4cbd3",
-  transFill: "#0e6e7c", transBorder: "#0b5c68", transText: "# effdff".replace(" ",""),
+  transFill: "#0e6e7c", transBorder: "#0b5c68", transText: "#effdff",
   transBadgeFill: "#0b5c68", transBadgeText: "#bdeef4",
   forkBar: "#1c1c1c", forkIcon: "#ffffff", forkText: "#1a1a1a",
   choiceFill: "#fbf4e0", choiceBorder: "#c98a10", choiceAccent: "#c98a10",
   choiceText: "#5a4a16", choiceBadgeFill: "#efe3bf", choiceBadgeText: "#8a6b18",
   initial: "#16a35c", end: "#e07b1f", endOk: "#16a35c", endErr: "#d92d20", bullet: "#16a35c", white: "#ffffff",
-  ui: { panel: "#ffffff", border: "#d7d7d2", text: "#23262b", subt: "#5a5f66", btn: "#ffffff", btnText: "#23262b", editorBg: "#fbfbf9", editorText: "#2a2d33" },
+  ui: { panel: "#ffffff", border: "#d7d7d2", text: "#23262b", subt: "#5a5f66", btn: "#ffffff", btnText: "#23262b", editorBg: "#fbfbf9", editorText: "#2a2d33", hover: "#efefe9", active: "#e7f4ee" },
 };
 
 const DARK = {
@@ -40,9 +37,8 @@ const DARK = {
   choiceFill: "#3a3320", choiceBorder: "#e8b53a", choiceAccent: "#e8b53a",
   choiceText: "#f6eccf", choiceBadgeFill: "#2a2415", choiceBadgeText: "#d9bf72",
   initial: "#1fb574", end: "#f0922b", endOk: "#1fce86", endErr: "#ef5350", bullet: "#19b67a", white: "#ffffff",
-  ui: { panel: "#0d1115", border: "#2c343c", text: "#dde3e8", subt: "#aeb6bd", btn: "#15191e", btnText: "#dde3e8", editorBg: "#0a0e12", editorText: "#c9d4dd" },
+  ui: { panel: "#0d1115", border: "#2c343c", text: "#dde3e8", subt: "#aeb6bd", btn: "#15191e", btnText: "#dde3e8", editorBg: "#0a0e12", editorText: "#c9d4dd", hover: "#161c22", active: "#10271f" },
 };
-LIGHT.transText = "#effdff";
 
 const DPR_DRAW = 2.5;
 const FONT_STACK = 'Inter, "SF Pro Display", "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif';
@@ -50,8 +46,8 @@ const FONT_LABEL = `600 14px ${FONT_STACK}`;
 const FONT_BADGE = `700 10px ${FONT_STACK}`;
 const FONT_FORK = `700 11px ${FONT_STACK}`;
 const NODE_H = 46, PAD_X = 14, GAP = 10, BADGE_PAD = 8, MAX_LABEL_W = 152;
-const COL_GAP = 74, ROW_GAP = 32;
 const BAR_W = 18, BAR_H = 58, DIA = 44;
+const GAPX = 72, ROWGAP = 26; // focus-view layout spacing
 
 /* --------------------------- SAMPLE JSON --------------------------- */
 const SAMPLE = {
@@ -91,7 +87,7 @@ const SAMPLE = {
   endStates: ["COMPLETE_PROCESS", "WITHDRAWN", "PROCESS_KO"],
 };
 
-/* --------------------- JSON -> graph model ------------------------ */
+/* --------------------- JSON -> state-centric model ---------------- */
 function stateCat(type = "") {
   const t = type.toLowerCase();
   if (t.includes("fork")) return "fork";
@@ -99,41 +95,181 @@ function stateCat(type = "") {
   if (t.includes("choice")) return "choice";
   return "simple";
 }
-function buildGraph(wf) {
-  const errors = [], nodes = [], edges = [];
-  const stateIds = new Set((wf.states || []).map((s) => s.id));
+const KO_TOKENS = new Set(["KO", "ERROR", "ERRORED", "FAIL", "FAILED", "FAILURE", "REJECT", "REJECTED", "CANCEL", "CANCELED", "CANCELLED", "WITHDRAWN", "WITHDRAWAL", "WITHDRAW", "ABORT", "ABORTED", "TIMEOUT", "DENIED", "EXPIRED", "REFUSED", "DECLINED", "INVALID", "BLOCKED"]);
+
+/* Each state holds its own incoming/outgoing transitions and any global
+ * (commonTransition) handlers. commonTransitions go into `globals` only —
+ * they are NEVER drawn as edges, which kills the fan-in spider web. */
+function buildModel(wf) {
+  const errors = [];
   const endSet = new Set(wf.endStates || []);
-  const KO_TOKENS = new Set(["KO", "ERROR", "ERRORED", "FAIL", "FAILED", "FAILURE", "REJECT", "REJECTED", "CANCEL", "CANCELED", "CANCELLED", "WITHDRAWN", "WITHDRAWAL", "WITHDRAW", "ABORT", "ABORTED", "TIMEOUT", "DENIED", "EXPIRED", "REFUSED", "DECLINED", "INVALID", "BLOCKED"]);
   const endNature = (id, s) => {
     const tokens = `${id} ${s.productStatus || ""} ${s.dossierStatus || ""}`.toUpperCase().split(/[^A-Z0-9]+/);
     return tokens.some((t) => KO_TOKENS.has(t)) ? "error" : "ok";
   };
+  const states = new Map();
   for (const s of wf.states || []) {
-    if (s == null || s.id == null) { errors.push("A state is missing an \"id\" and was skipped"); continue; }
+    if (s == null || s.id == null) { errors.push('A state is missing an "id" and was skipped'); continue; }
     const cat = stateCat(s.type);
-    nodes.push({
-      id: s.id, kind: "state", label: String(s.id), badge: s.type || "SimpleState", cat,
+    states.set(s.id, {
+      id: s.id, type: s.type || "SimpleState", badge: s.type || "SimpleState", cat,
       isInitial: s.id === wf.initialState, isEnd: endSet.has(s.id),
       endStatus: endSet.has(s.id) ? endNature(s.id, s) : null,
-      hasBullet: !!s.microfrontendBullet,
-      renderKind: cat === "fork" || cat === "join" ? "bar" : cat === "choice" ? "diamond" : "box",
+      hasBullet: !!s.microfrontendBullet, bulletName: s.bulletName || null,
+      productStatus: s.productStatus || null, dossierStatus: s.dossierStatus || null,
+      out: [], in: [], globals: [],
     });
   }
-  let tc = 0;
-  const add = (source, target, event) => {
-    const okS = stateIds.has(source), okT = stateIds.has(target);
-    if (!okS) errors.push(`Unknown source "${source}" (event ${event}) — transition skipped`);
-    if (!okT) errors.push(`Unknown target "${target}" (event ${event}) — transition skipped`);
+  const order = [...states.keys()];
+  const add = (source, target, event, kind) => {
+    const okS = states.has(source), okT = states.has(target);
+    if (!okS) errors.push(`Unknown source "${source}" (event ${event}) — skipped`);
+    if (!okT) errors.push(`Unknown target "${target}" (event ${event}) — skipped`);
     if (!okS || !okT) return;
-    const id = `__t${tc++}__${event}`;
-    nodes.push({ id, kind: "transition", label: String(event), badge: "External", cat: "transition", renderKind: "box" });
-    edges.push({ id: id + "-in", source, target: id });
-    edges.push({ id: id + "-out", source: id, target });
+    if (kind === "global") states.get(source).globals.push({ event, target });
+    else { states.get(source).out.push({ event, target }); states.get(target).in.push({ event, source }); }
   };
-  for (const t of wf.transitions || []) add(t.source, t.target, t.event);
-  for (const ct of wf.commonTransitions || []) for (const s of ct.sourceList || []) add(s, ct.target, ct.event);
-  if (wf.initialState && !stateIds.has(wf.initialState)) errors.push(`initialState "${wf.initialState}" is not a defined state`);
-  return { nodes, edges, errors, initial: wf.initialState };
+  for (const t of wf.transitions || []) add(t.source, t.target, t.event, "normal");
+  const globalsList = [];
+  for (const ct of wf.commonTransitions || []) {
+    globalsList.push({ event: ct.event, target: ct.target, sourceList: [...(ct.sourceList || [])] });
+    for (const s of ct.sourceList || []) add(s, ct.target, ct.event, "global");
+  }
+  if (wf.initialState && !states.has(wf.initialState)) errors.push(`initialState "${wf.initialState}" is not a defined state`);
+  return { states, order, initial: wf.initialState, endStates: [...endSet], globalsList, errors };
+}
+
+/* --------------------------- analysis ---------------------------- */
+function analyze(model) {
+  const { states, initial, endStates } = model;
+  const fwd = new Map(), rev = new Map();
+  for (const id of states.keys()) { fwd.set(id, []); rev.set(id, []); }
+  for (const [id, s] of states) for (const e of [...s.out, ...s.globals]) {
+    if (!states.has(e.target)) continue;
+    fwd.get(id).push(e.target); rev.get(e.target).push(id);
+  }
+  const bfs = (starts, adj) => {
+    const seen = new Set(starts.filter((x) => states.has(x))), q = [...seen];
+    while (q.length) { const c = q.shift(); for (const t of adj.get(c) || []) if (!seen.has(t)) { seen.add(t); q.push(t); } }
+    return seen;
+  };
+  const reachable = initial ? bfs([initial], fwd) : new Set();
+  const canReachEnd = bfs(endStates, rev);
+  const unreachable = [], cannotReachEnd = [], deadEnds = [];
+  for (const [id, s] of states) {
+    if (initial && !reachable.has(id)) unreachable.push(id);
+    if (!canReachEnd.has(id)) cannotReachEnd.push(id);
+    if (!s.isEnd && s.out.length === 0 && s.globals.length === 0) deadEnds.push(id);
+  }
+  return { reachable, canReachEnd, unreachable, cannotReachEnd, deadEnds };
+}
+/* BFS shortest path from -> to (over real + global edges). Returns an array of
+ * { state, event } steps (event is the transition taken to reach `state`). */
+function shortestPath(model, from, to) {
+  const { states } = model;
+  if (!states.has(from) || !states.has(to)) return null;
+  if (from === to) return [{ state: from, event: null }];
+  const prev = new Map(), seen = new Set([from]); let q = [from], done = false;
+  while (q.length && !done) {
+    const c = q.shift(), s = states.get(c);
+    for (const e of [...s.out, ...s.globals]) if (!seen.has(e.target) && states.has(e.target)) {
+      seen.add(e.target); prev.set(e.target, { from: c, event: e.event });
+      if (e.target === to) { done = true; break; }
+      q.push(e.target);
+    }
+  }
+  if (!prev.has(to)) return null;
+  const path = []; let cur = to;
+  while (cur !== from) { const p = prev.get(cur); path.push({ state: cur, event: p.event }); cur = p.from; }
+  path.push({ state: from, event: null }); path.reverse(); return path;
+}
+function pathToNearestEnd(model, from) {
+  const ends = new Set(model.endStates);
+  if (ends.has(from)) return [{ state: from, event: null }];
+  const prev = new Map(), seen = new Set([from]); let q = [from], found = null;
+  while (q.length && !found) {
+    const c = q.shift(), s = model.states.get(c); if (!s) continue;
+    for (const e of [...s.out, ...s.globals]) if (!seen.has(e.target) && model.states.has(e.target)) {
+      seen.add(e.target); prev.set(e.target, { from: c, event: e.event });
+      if (ends.has(e.target)) { found = e.target; break; }
+      q.push(e.target);
+    }
+  }
+  if (!found) return null;
+  const path = []; let cur = found;
+  while (cur !== from) { const p = prev.get(cur); path.push({ state: cur, event: p.event }); cur = p.from; }
+  path.push({ state: from, event: null }); path.reverse(); return path;
+}
+
+/* --------------- focused subgraph (one hop around center) --------- */
+function stateNode(s) {
+  return {
+    id: s.id, kind: "state", label: s.id, badge: s.badge, cat: s.cat,
+    isInitial: s.isInitial, isEnd: s.isEnd, endStatus: s.endStatus, hasBullet: s.hasBullet,
+    renderKind: s.cat === "fork" || s.cat === "join" ? "bar" : s.cat === "choice" ? "diamond" : "box",
+  };
+}
+function eventNode(id, event) {
+  return { id, kind: "transition", label: String(event), badge: "External", cat: "transition", renderKind: "box" };
+}
+/* Builds the local view: center in the middle, predecessors stacked on the
+ * left (source state + event), successors stacked on the right (event +
+ * target state). Always small, so it lays out cleanly without any solver. */
+function buildFocusView(model, centerId, m) {
+  const center = model.states.get(centerId);
+  if (!center) return { nodes: [], edges: [] };
+  const cNode = stateNode(center); cNode.isCenter = true; cNode._sz = nodeSize(cNode, m);
+
+  const succ = center.out.map((e, i) => {
+    const ev = eventNode(`succ-ev-${i}`, e.event); ev._sz = nodeSize(ev, m); ev.navTo = e.target;
+    const stN = stateNode(model.states.get(e.target) || { id: e.target, badge: "?", cat: "simple" });
+    stN.id = `succ-st-${i}`; stN.navTo = e.target; stN._sz = nodeSize(stN, m);
+    return { ev, st: stN };
+  });
+  const pred = center.in.map((e, j) => {
+    const ev = eventNode(`pred-ev-${j}`, e.event); ev._sz = nodeSize(ev, m); ev.navTo = e.source;
+    const stN = stateNode(model.states.get(e.source) || { id: e.source, badge: "?", cat: "simple" });
+    stN.id = `pred-st-${j}`; stN.navTo = e.source; stN._sz = nodeSize(stN, m);
+    return { ev, st: stN };
+  });
+
+  const maxW = (arr, k) => arr.reduce((mx, r) => Math.max(mx, r[k]._sz.w), 0);
+  const wSuccEv = maxW(succ, "ev"), wSuccSt = maxW(succ, "st");
+  const wPredEv = maxW(pred, "ev"), wPredSt = maxW(pred, "st");
+  const wC = cNode._sz.w;
+
+  const xSuccEv = wC / 2 + GAPX + wSuccEv / 2;
+  const xSuccSt = xSuccEv + wSuccEv / 2 + GAPX + wSuccSt / 2;
+  const xPredEv = -(wC / 2 + GAPX + wPredEv / 2);
+  const xPredSt = xPredEv - (wPredEv / 2 + GAPX + wPredSt / 2);
+
+  const stack = (rows, xEv, xSt) => {
+    const heights = rows.map((r) => Math.max(r.ev._sz.h, r.st._sz.h));
+    const total = heights.reduce((a, b) => a + b, 0) + ROWGAP * Math.max(0, rows.length - 1);
+    let y = -total / 2;
+    rows.forEach((r, i) => {
+      const cy = y + heights[i] / 2;
+      r.ev.x = xEv; r.ev.y = cy; r.st.x = xSt; r.st.y = cy;
+      y += heights[i] + ROWGAP;
+    });
+  };
+  stack(succ, xSuccEv, xSuccSt);
+  stack(pred, xPredEv, xPredSt);
+  cNode.x = 0; cNode.y = 0;
+
+  const nodes = [cNode];
+  const edges = [];
+  succ.forEach((r, i) => {
+    nodes.push(r.ev, r.st);
+    edges.push({ id: `es-out-${i}`, source: cNode.id, target: r.ev.id });
+    edges.push({ id: `es-in-${i}`, source: r.ev.id, target: r.st.id });
+  });
+  pred.forEach((r, j) => {
+    nodes.push(r.st, r.ev);
+    edges.push({ id: `ep-out-${j}`, source: r.st.id, target: r.ev.id });
+    edges.push({ id: `ep-in-${j}`, source: r.ev.id, target: cNode.id });
+  });
+  return { nodes, edges };
 }
 
 /* ----------------------- canvas drawing --------------------------- */
@@ -151,14 +287,9 @@ function cutleryFork(ctx, cx, cy, h, color) {
   ctx.beginPath(); ctx.moveTo(cx, neck + 2); ctx.lineTo(cx, tip); ctx.stroke();
 }
 function spartanLambda(ctx, cx, cy, h, color) {
-  // Spartan shield mark: bold lambda (Λ), aka the "Spartan A"
   const top = cy - h / 2, bot = cy + h / 2, leg = h * 0.44;
   ctx.strokeStyle = color; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(cx - leg, bot);
-  ctx.lineTo(cx, top);
-  ctx.lineTo(cx + leg, bot);
-  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - leg, bot); ctx.lineTo(cx, top); ctx.lineTo(cx + leg, bot); ctx.stroke();
 }
 function nodeSize(node, m) {
   m.font = node.renderKind === "bar" ? FONT_FORK : FONT_LABEL;
@@ -191,9 +322,9 @@ function trunc(ctx, label, max) {
   let lo = 0, hi = label.length - 1;
   while (lo < hi) {
     const mid = (lo + hi + 1) >> 1;
-    if (ctx.measureText(label.slice(0, mid) + "\u2026").width <= max) lo = mid; else hi = mid - 1;
+    if (ctx.measureText(label.slice(0, mid) + "…").width <= max) lo = mid; else hi = mid - 1;
   }
-  return label.slice(0, lo) + "\u2026";
+  return label.slice(0, lo) + "…";
 }
 function drawNode(node, sz, th, dpr = DPR_DRAW) {
   const cv = document.createElement("canvas");
@@ -260,7 +391,7 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
       ctx.fillStyle = th.initial; ctx.beginPath(); ctx.arc(cx + 8, iy, 8, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = th.white; ctx.beginPath(); ctx.moveTo(cx + 5.5, iy - 4); ctx.lineTo(cx + 12, iy); ctx.lineTo(cx + 5.5, iy + 4); ctx.closePath(); ctx.fill();
     } else if (node.hasBullet) {
-      // microfrontend bullet: filled dot inside a thin ring (distinct from end-state ✓/✕)
+      // microfrontend bullet: filled dot inside a thin ring
       ctx.beginPath(); ctx.arc(cx + 8, iy, 8, 0, Math.PI * 2);
       ctx.lineWidth = 1.6; ctx.strokeStyle = th.bullet; ctx.stroke();
       ctx.beginPath(); ctx.arc(cx + 8, iy, 4, 0, Math.PI * 2);
@@ -277,96 +408,6 @@ function drawNode(node, sz, th, dpr = DPR_DRAW) {
   return cv;
 }
 
-/* ------------------------ ELK layered layout ---------------------- *
- *  ELK computes both node placement (crossing-minimised) and clean
- *  orthogonal edge routing through reserved channels, so long edges no
- *  longer cut across nodes. Node coords are converted to centers and
- *  each edge gets a routed polyline in e._route.
- * ------------------------------------------------------------------ */
-const ELK_OPTS = {
-  "elk.algorithm": "layered",
-  "elk.direction": "RIGHT",
-  "elk.edgeRouting": "ORTHOGONAL",
-  "elk.layered.spacing.nodeNodeBetweenLayers": "78",
-  "elk.spacing.nodeNode": "46",
-  "elk.layered.spacing.edgeNodeBetweenLayers": "26",
-  "elk.layered.spacing.edgeEdgeBetweenLayers": "16",
-  "elk.spacing.edgeNode": "20",
-  "elk.spacing.edgeEdge": "14",
-  "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-  "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
-  "elk.layered.crossingMinimization.semiInteractive": "true",
-  "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
-  "elk.layered.mergeEdges": "false",
-};
-const ELK_OPTS_LARGE = {
-  ...ELK_OPTS,
-  "elk.edgeRouting": "POLYLINE",
-  "elk.layered.nodePlacement.strategy": "LINEAR_SEGMENTS",
-  "elk.layered.crossingMinimization.strategy": "GREEDY",
-  "elk.layered.crossingMinimization.semiInteractive": "false",
-  "elk.layered.considerModelOrder.strategy": "NONE",
-  "elk.layered.mergeEdges": "true",
-};
-/* Fast BFS hierarchical layout — O(V+E), no recursion, handles cycles.
- * Used automatically when the graph is too large for ELK, and as a
- * guaranteed fallback if ELK throws any error. */
-function fallbackLayout(nodes, edges) {
-  const out = new Map(nodes.map((n) => [n.id, []]));
-  for (const e of edges) out.get(e.source)?.push(e.target);
-  const hasPred = new Set(edges.map((e) => e.target));
-  const layer = new Map();
-  const q = [];
-  for (const n of nodes) if (!hasPred.has(n.id)) { layer.set(n.id, 0); q.push(n.id); }
-  if (!q.length && nodes.length) { layer.set(nodes[0].id, 0); q.push(nodes[0].id); }
-  while (q.length) {
-    const id = q.shift(), l = layer.get(id);
-    for (const tid of out.get(id) || []) if (!layer.has(tid)) { layer.set(tid, l + 1); q.push(tid); }
-  }
-  let maxL = 0;
-  for (const [, l] of layer) if (l > maxL) maxL = l;
-  for (const n of nodes) if (!layer.has(n.id)) layer.set(n.id, ++maxL);
-  const byLayer = [];
-  for (const n of nodes) { const l = layer.get(n.id); while (byLayer.length <= l) byLayer.push([]); byLayer[l].push(n); }
-  const COL_GAP = 80, ROW_GAP = 36;
-  let cx = 0;
-  for (const ns of byLayer) {
-    const maxW = ns.reduce((m, n) => Math.max(m, n._sz.w), 0);
-    const totalH = ns.reduce((s, n) => s + n._sz.h, 0) + ROW_GAP * (ns.length - 1);
-    let y = -totalH / 2;
-    for (const n of ns) { n.x = cx + maxW / 2; n.y = y + n._sz.h / 2; y += n._sz.h + ROW_GAP; }
-    cx += maxW + COL_GAP;
-  }
-  for (const e of edges) e._route = null;
-}
-async function layoutGraph(nodes, edges) {
-  if (nodes.length > 150) { fallbackLayout(nodes, edges); return; }
-  const g = {
-    id: "root",
-    layoutOptions: nodes.length > 60 ? ELK_OPTS_LARGE : ELK_OPTS,
-    children: nodes.map((n) => ({ id: n.id, width: n._sz.w, height: n._sz.h })),
-    edges: edges.map((e) => ({ id: e.id, sources: [e.source], targets: [e.target] })),
-  };
-  const res = await elk.layout(g);
-  const cpos = new Map((res.children || []).map((c) => [c.id, c]));
-  for (const n of nodes) { const c = cpos.get(n.id); if (c) { n.x = c.x + n._sz.w / 2; n.y = c.y + n._sz.h / 2; } }
-  const resEdgeMap = new Map((res.edges || []).map((re) => [re.id, re]));
-  for (const e of edges) {
-    const re = resEdgeMap.get(e.id);
-    if (re && re.sections && re.sections.length) {
-      const s = re.sections[0];
-      e._route = round([[s.startPoint.x, s.startPoint.y], ...(s.bendPoints || []).map((p) => [p.x, p.y]), [s.endPoint.x, s.endPoint.y]], 8);
-    } else e._route = null;
-  }
-}
-/* lightweight reroute used only while a node is being dragged */
-function simpleRoute(a, b) {
-  const ax = a.x + a._sz.anchorW / 2, ay = a.y, bx = b.x - b._sz.anchorW / 2, by = b.y;
-  if (bx > ax + 26) { const mx = (ax + bx) / 2; return round([[ax, ay], [mx, ay], [mx, by], [bx, by]], 8); }
-  const ly = Math.max(ay, by) + a._sz.h / 2 + 34;
-  return round([[ax, ay], [ax + 20, ay], [ax + 20, ly], [bx - 20, ly], [bx - 20, by], [bx, by]], 8);
-}
-
 /* --------------------- edge geometry ------------------------------ */
 function round(pts, r) {
   if (pts.length < 3) return pts;
@@ -378,6 +419,12 @@ function round(pts, r) {
     out.push([cx + (nx - cx) * (rr2 / d2), cy + (ny - cy) * (rr2 / d2)]);
   }
   out.push(pts[pts.length - 1]); return out;
+}
+function simpleRoute(a, b) {
+  const ax = a.x + a._sz.anchorW / 2, ay = a.y, bx = b.x - b._sz.anchorW / 2, by = b.y;
+  if (bx > ax + 26) { const mx = (ax + bx) / 2; return round([[ax, ay], [mx, ay], [mx, by], [bx, by]], 8); }
+  const ly = Math.max(ay, by) + a._sz.h / 2 + 34;
+  return round([[ax, ay], [ax + 20, ay], [ax + 20, ly], [bx - 20, ly], [bx - 20, by], [bx, by]], 8);
 }
 function ribbon(pts, hw, z) {
   const v = [];
@@ -396,29 +443,8 @@ function arrow(pts, sz, z) {
   const nx = -dy, ny = dx;
   return [x2, -y2, z, (x2 - dx * sz) + nx * sz * 0.55, -((y2 - dy * sz) + ny * sz * 0.55), z, (x2 - dx * sz) - nx * sz * 0.55, -((y2 - dy * sz) - ny * sz * 0.55), z];
 }
-function buildAdj(edges) {
-  const adj = new Map();
-  for (const e of edges) (adj.get(e.source) || adj.set(e.source, []).get(e.source)).push(e);
-  return adj;
-}
-/* Focus only the *direct next states*: the clicked state, its outgoing transition
- * nodes, and the states those lead to (one logical hop = 2 edge levels).
- * No transitive recursion, so the rest of the graph stays out of the focus set. */
-function directFocus(start, adj) {
-  const nodeSet = new Set([start]), edgeSet = new Set();
-  for (const e of adj.get(start) || []) {
-    edgeSet.add(e.id); nodeSet.add(e.target);
-    for (const e2 of adj.get(e.target) || []) { edgeSet.add(e2.id); nodeSet.add(e2.target); }
-  }
-  return { nodeSet, edgeSet };
-}
 
-/* ============================ EXPORT ENGINE ====================== *
- *  Builds a resolution-independent SVG of the whole diagram (vector
- *  edges + arrowheads, nodes embedded as high-DPR images so fonts &
- *  styling are pixel-identical to the live view), then derives
- *  SVG / PNG / JPEG / PDF / Print from it with automatic page fitting.
- * ================================================================== */
+/* ============================ EXPORT ENGINE ====================== */
 const PAPER_MM = { A4: [210, 297], A3: [297, 420], A5: [148, 210], Letter: [215.9, 279.4], Tabloid: [279.4, 431.8] };
 
 function buildDiagramSVG(nodes, edges, th, { pad = 48, dpr = 4 } = {}) {
@@ -532,16 +558,23 @@ function printDiagram(svg, width, height, { title }) {
 }
 
 /* ------------------------- React component ------------------------ */
+const GROUPS = [
+  { key: "initial", label: "Initial", test: (s) => s.isInitial },
+  { key: "end", label: "End states", test: (s) => s.isEnd },
+  { key: "choice", label: "Choices", test: (s) => s.cat === "choice" },
+  { key: "forkjoin", label: "Forks & Joins", test: (s) => s.cat === "fork" || s.cat === "join" },
+  { key: "simple", label: "States", test: (s) => s.cat === "simple" && !s.isInitial && !s.isEnd },
+];
+
 export default function WorkflowGraphWebGL() {
   const mountRef = useRef(null);
   const S = useRef({});
-  const manualPos = useRef(new Map());   // node id -> {x,y}, persists across theme switch
-  const lastGraph = useRef(null);
+  const navigateRef = useRef(() => {});
+  const centerRef = useRef(null);
+
   const [jsonText, setJsonText] = useState(JSON.stringify(SAMPLE, null, 2));
   const [editorOpen, setEditorOpen] = useState(false);
-  const [errors, setErrors] = useState([]);
   const [graphData, setGraphData] = useState(SAMPLE);
-  const [selected, setSelected] = useState(null);
   const [themeName, setThemeName] = useState("light");
   const [exportOpen, setExportOpen] = useState(false);
   const [busy, setBusy] = useState(null);
@@ -549,50 +582,57 @@ export default function WorkflowGraphWebGL() {
   const [paper, setPaper] = useState("A4");
   const [margin, setMargin] = useState(12);
   const [toast, setToast] = useState(null);
+  const [search, setSearch] = useState("");
+  const [center, setCenter] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [future, setFuture] = useState([]);
+
   const th = themeName === "light" ? LIGHT : DARK;
+  const u = th.ui;
+
+  const model = useMemo(() => buildModel(graphData), [graphData]);
+  const analysis = useMemo(() => analyze(model), [model]);
+
+  centerRef.current = center;
+  const centerState = center ? model.states.get(center) : null;
+
+  // reset focus to the initial state whenever the model changes
+  useEffect(() => {
+    const start = model.initial && model.states.has(model.initial) ? model.initial : model.order[0] || null;
+    setCenter(start); setHistory([]); setFuture([]);
+  }, [model]);
 
   const notify = (msg) => { setToast(msg); setTimeout(() => setToast(null), 4200); };
-  const currentSVG = (opts) => {
-    const s = S.current;
-    if (!s.nodes) return null;
-    return buildDiagramSVG(s.nodes, s.edges, s.th, opts);
+
+  const goTo = (id, { record = true } = {}) => {
+    if (!id || !model.states.has(id) || id === centerRef.current) { if (id === centerRef.current) S.current.recenter?.(); return; }
+    if (record && centerRef.current) { setHistory((h) => [...h, centerRef.current]); setFuture([]); }
+    setCenter(id);
   };
-  const doExport = async (kind) => {
-    const s = S.current;
-    if (!s.nodes) return;
-    setBusy(kind);
-    try {
-      const title = s.title || "state-machine";
-      if (kind === "svg") {
-        const { svg } = currentSVG({ dpr: 4 });
-        downloadBlob(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), `${title}.svg`);
-      } else if (kind === "png" || kind === "jpeg") {
-        const { svg, width, height, bg } = currentSVG({ dpr: 4 });
-        const mime = kind === "png" ? "image/png" : "image/jpeg";
-        const blob = await rasterize(svg, width, height, pngScale, mime, bg);
-        downloadBlob(blob, `${title}@${pngScale}x.${kind === "png" ? "png" : "jpg"}`);
-      } else if (kind === "pdf") {
-        const { svg, width, height } = currentSVG({ dpr: 4 });
-        await exportPDF(svg, width, height, { paper, margin, title });
-      } else if (kind === "print") {
-        const { svg, width, height } = currentSVG({ dpr: 4 });
-        if (!printDiagram(svg, width, height, { title })) notify("Pop-up blocked — allow pop-ups to print.");
-      }
-    } catch (err) {
-      if (kind === "pdf") notify("PDF needs jspdf + svg2pdf.js — run: npm i jspdf svg2pdf.js");
-      else notify("Export failed: " + (err?.message || err));
-      console.error(err);
-    } finally { setBusy(null); }
+  navigateRef.current = (id) => goTo(id);
+  const back = () => {
+    if (!history.length) return;
+    const prev = history[history.length - 1];
+    setHistory(history.slice(0, -1));
+    setFuture([center, ...future]);
+    setCenter(prev);
+  };
+  const forward = () => {
+    if (!future.length) return;
+    const nxt = future[0];
+    setFuture(future.slice(1));
+    setHistory([...history, center]);
+    setCenter(nxt);
   };
 
+  /* ---- WebGL renderer: created once per (model, theme); content swapped imperatively ---- */
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
-    if (lastGraph.current !== graphData) { manualPos.current = new Map(); lastGraph.current = graphData; }
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(th.bg);
-    let W = container.clientWidth, H = container.clientHeight;
+    let W = container.clientWidth || 800, H = container.clientHeight || 600;
     const camera = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -1000, 1000);
     camera.position.z = 10;
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -600,291 +640,363 @@ export default function WorkflowGraphWebGL() {
     renderer.setSize(W, H); renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(renderer.domElement);
     const group = new THREE.Group(); scene.add(group);
-    const disposables = [];
 
-    let cancelled = false;
-    let raf = 0, ro = null, cleanupInteraction = null, eGeoRef = null, aGeoRef = null;
+    const m = mctx();
+    let raf = 0, ro = null;
+    let nodeMeshes = [], nodeDisposables = [];
+    let eMesh = null, aMesh = null, eGeo = null, aGeo = null;
+    let curNodes = [], curEdges = [];
 
-    (async () => {
-      const { nodes, edges, initial, errors: errs } = buildGraph(graphData);
-      if (cancelled) return;
-      setErrors(errs);
-      const m = mctx();
-      nodes.forEach((n) => (n._sz = nodeSize(n, m)));
-
-      try { await layoutGraph(nodes, edges); } catch (e) { fallbackLayout(nodes, edges); setErrors((p) => [...p, "ELK failed, auto-layout used: " + (e?.message || e)]); }
-      if (cancelled) return;
-
-      const id2 = new Map(nodes.map((n) => [n.id, n]));
-      const incidence = new Map(nodes.map((n) => [n.id, []]));
-      for (const e of edges) { incidence.get(e.source)?.push(e); incidence.get(e.target)?.push(e); }
-      const adj = buildAdj(edges);
-      const reroute = (id) => { for (const e of incidence.get(id) || []) { const a = id2.get(e.source), b = id2.get(e.target); if (a && b) e._route = simpleRoute(a, b); } };
-      // apply any manual positions kept from before, rerouting their edges
-      for (const n of nodes) { const p = manualPos.current.get(n.id); if (p) { n.x = p.x; n.y = p.y; reroute(n.id); } }
-
-      let eMesh = null, aMesh = null, eGeo = null, aGeo = null, eRange = new Map(), aRange = new Map();
-      const baseE = new THREE.Color(th.edge), baseA = new THREE.Color(th.arrow), HI = new THREE.Color(th.edgeHi), DIM = new THREE.Color(th.edgeDim);
-      const nodeMeshes = [];
-      function buildEdges() {
-        const eP = [], eC = [], aP = [], aC = []; eRange = new Map(); aRange = new Map();
-        for (const e of edges) {
-          const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
-          const pts = e._route || simpleRoute(a, b);
-          const rv = ribbon(pts, 1.1, -1), es = eP.length / 3;
-          Array.prototype.push.apply(eP, rv); for (let i = 0; i < rv.length / 3; i++) eC.push(baseE.r, baseE.g, baseE.b);
-          eRange.set(e.id, [es, rv.length / 3]);
-          const av = arrow(pts, 14, -0.5), as = aP.length / 3;
-          Array.prototype.push.apply(aP, av); for (let i = 0; i < av.length / 3; i++) aC.push(baseA.r, baseA.g, baseA.b);
-          aRange.set(e.id, [as, av.length / 3]);
-        }
-        if (eMesh) { group.remove(eMesh); eGeo.dispose(); }
-        if (aMesh) { group.remove(aMesh); aGeo.dispose(); }
-        eGeo = new THREE.BufferGeometry();
-        eGeo.setAttribute("position", new THREE.Float32BufferAttribute(eP, 3));
-        eGeo.setAttribute("color", new THREE.Float32BufferAttribute(eC, 3));
-        eMesh = new THREE.Mesh(eGeo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95 }));
-        aGeo = new THREE.BufferGeometry();
-        aGeo.setAttribute("position", new THREE.Float32BufferAttribute(aP, 3));
-        aGeo.setAttribute("color", new THREE.Float32BufferAttribute(aC, 3));
-        aMesh = new THREE.Mesh(aGeo, new THREE.MeshBasicMaterial({ vertexColors: true }));
-        group.add(eMesh); group.add(aMesh);
-        eGeoRef = eGeo; aGeoRef = aGeo;
-        applyHighlight(S.current.closure);
+    const clearFocus = () => {
+      for (const mm of nodeMeshes) group.remove(mm);
+      nodeDisposables.forEach((d) => d.dispose && d.dispose()); nodeDisposables = []; nodeMeshes = [];
+      if (eMesh) { group.remove(eMesh); eGeo.dispose(); eMesh.material.dispose(); eMesh = null; }
+      if (aMesh) { group.remove(aMesh); aGeo.dispose(); aMesh.material.dispose(); aMesh = null; }
+    };
+    const buildEdges = () => {
+      const id2 = new Map(curNodes.map((n) => [n.id, n]));
+      const eP = [], eC = [], aP = [], aC = [];
+      const baseE = new THREE.Color(th.edge), baseA = new THREE.Color(th.arrow);
+      for (const e of curEdges) {
+        const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
+        const pts = e._route || simpleRoute(a, b);
+        const rv = ribbon(pts, 1.1, -1); Array.prototype.push.apply(eP, rv); for (let i = 0; i < rv.length / 3; i++) eC.push(baseE.r, baseE.g, baseE.b);
+        const av = arrow(pts, 14, -0.5); Array.prototype.push.apply(aP, av); for (let i = 0; i < av.length / 3; i++) aC.push(baseA.r, baseA.g, baseA.b);
       }
-      function applyHighlight(cl) {
-        S.current.closure = cl || null;
-        const setR = (attr, range, c) => { if (!range) return; const [st, ct] = range; for (let i = 0; i < ct; i++) attr.setXYZ(st + i, c.r, c.g, c.b); attr.needsUpdate = true; };
-        for (const e of edges) {
-          const on = !cl || cl.edgeSet.has(e.id);
-          setR(eGeo.attributes.color, eRange.get(e.id), cl ? (on ? HI : DIM) : baseE);
-          setR(aGeo.attributes.color, aRange.get(e.id), cl ? (on ? HI : baseA) : baseA);
-        }
-        nodeMeshes.forEach((mm) => { mm.material.opacity = !cl || cl.nodeSet.has(mm.userData.nodeId) ? 1 : 0.2; });
-        S.current.dirty = true;
-      }
-      function patchEdges(incidentEdges) {
-        const ePos = eGeo.attributes.position, aPos = aGeo.attributes.position;
-        for (const e of incidentEdges) {
-          const a = id2.get(e.source), b = id2.get(e.target); if (!a || !b) continue;
-          const pts = e._route || simpleRoute(a, b);
-          const rv = ribbon(pts, 1.1, -1), er = eRange.get(e.id);
-          if (!er || rv.length / 3 !== er[1]) { buildEdges(); return; }
-          for (let i = 0, k = er[0]; i < rv.length; i += 3, k++) ePos.setXYZ(k, rv[i], rv[i + 1], rv[i + 2]);
-          const av = arrow(pts, 14, -0.5), ar = aRange.get(e.id);
-          if (!ar || av.length / 3 !== ar[1]) { buildEdges(); return; }
-          for (let i = 0, k = ar[0]; i < av.length; i += 3, k++) aPos.setXYZ(k, av[i], av[i + 1], av[i + 2]);
-        }
-        ePos.needsUpdate = true; aPos.needsUpdate = true;
-      }
+      eGeo = new THREE.BufferGeometry();
+      eGeo.setAttribute("position", new THREE.Float32BufferAttribute(eP, 3));
+      eGeo.setAttribute("color", new THREE.Float32BufferAttribute(eC, 3));
+      eMesh = new THREE.Mesh(eGeo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95 }));
+      aGeo = new THREE.BufferGeometry();
+      aGeo.setAttribute("position", new THREE.Float32BufferAttribute(aP, 3));
+      aGeo.setAttribute("color", new THREE.Float32BufferAttribute(aC, 3));
+      aMesh = new THREE.Mesh(aGeo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true }));
+      group.add(eMesh); group.add(aMesh);
+    };
+    const rebuildEdges = () => {
+      if (eMesh) { group.remove(eMesh); eGeo.dispose(); eMesh.material.dispose(); eMesh = null; }
+      if (aMesh) { group.remove(aMesh); aGeo.dispose(); aMesh.material.dispose(); aMesh = null; }
+      const id2 = new Map(curNodes.map((n) => [n.id, n]));
+      for (const e of curEdges) { const a = id2.get(e.source), b = id2.get(e.target); e._route = a && b ? simpleRoute(a, b) : null; }
+      buildEdges();
+    };
 
-      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, initNode = null;
-      const CHUNK = 50;
-      for (let ci = 0; ci < nodes.length; ci += CHUNK) {
-        if (cancelled) return;
-        const end = Math.min(ci + CHUNK, nodes.length);
-        for (let ni = ci; ni < end; ni++) {
-          const n = nodes[ni];
-          const tex = new THREE.CanvasTexture(drawNode(n, n._sz, th));
-          tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.colorSpace = THREE.SRGBColorSpace;
-          const geo = new THREE.PlaneGeometry(n._sz.w, n._sz.h);
-          const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
-          mesh.position.set(n.x, -n.y, 0); mesh.userData.nodeId = n.id; mesh.userData.node = n;
-          group.add(mesh); nodeMeshes.push(mesh); disposables.push(tex, geo, mesh.material);
-          if (n.id === initial) initNode = n;
-          minX = Math.min(minX, n.x - n._sz.w / 2); maxX = Math.max(maxX, n.x + n._sz.w / 2);
-          minY = Math.min(minY, n.y - n._sz.h / 2); maxY = Math.max(maxY, n.y + n._sz.h / 2);
-        }
-        if (end < nodes.length) await new Promise((r) => setTimeout(r, 0));
+    const st = S.current;
+    st.cur = st.cur || { x: 0, y: 0, zoom: 1 };
+    st.targetZoom = st.cur.zoom; st.focal = null; st.vel = { x: 0, y: 0 }; st.mode = null; st.dirty = true;
+    st.targetX = st.cur.x; st.targetY = st.cur.y; st.flying = false; st.fade = 1;
+
+    const apply = () => { camera.zoom = st.cur.zoom; camera.position.set(st.cur.x, st.cur.y, 10); camera.updateProjectionMatrix(); };
+
+    st.showCenter = (centerId) => {
+      if (!model.states.has(centerId)) centerId = model.initial && model.states.has(model.initial) ? model.initial : model.order[0];
+      if (!centerId) { clearFocus(); st.dirty = true; return; }
+      clearFocus();
+      const fv = buildFocusView(model, centerId, m);
+      curNodes = fv.nodes; curEdges = fv.edges;
+      const id2 = new Map(curNodes.map((n) => [n.id, n]));
+      for (const e of curEdges) { const a = id2.get(e.source), b = id2.get(e.target); e._route = a && b ? simpleRoute(a, b) : null; }
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const n of curNodes) {
+        const tex = new THREE.CanvasTexture(drawNode(n, n._sz, th));
+        tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false; tex.colorSpace = THREE.SRGBColorSpace;
+        const geo = new THREE.PlaneGeometry(n._sz.w, n._sz.h);
+        const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+        const mesh = new THREE.Mesh(geo, mat); mesh.position.set(n.x, -n.y, n.isCenter ? 0.2 : 0);
+        mesh.userData.node = n; mesh.userData.navTo = n.navTo || null;
+        group.add(mesh); nodeMeshes.push(mesh); nodeDisposables.push(tex, geo, mat);
+        minX = Math.min(minX, n.x - n._sz.w / 2); maxX = Math.max(maxX, n.x + n._sz.w / 2);
+        minY = Math.min(minY, n.y - n._sz.h / 2); maxY = Math.max(maxY, n.y + n._sz.h / 2);
       }
       buildEdges();
       if (!isFinite(minX)) { minX = -100; maxX = 100; minY = -100; maxY = 100; }
+      const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.3;
+      st.targetZoom = Math.min(Math.max(Math.min(W / (gw * p), H / (gh * p)), 0.4), 1.7);
+      st.cur.zoom = st.targetZoom; st.focal = null; st.flying = false;
+      st.cur.x = (minX + maxX) / 2; st.targetX = st.cur.x;
+      st.cur.y = -(minY + maxY) / 2; st.targetY = st.cur.y;
+      st.fade = 0;
+      st.nodes = curNodes; st.edges = curEdges; st.th = th; st.title = String(graphData.id || "state-machine");
+      st.dirty = true;
+    };
+    st.recenter = () => { if (st.nodes) st.showCenter(centerRef.current); };
+    st.zoomBy = (f) => { st.targetZoom = Math.min(Math.max(st.targetZoom * f, 0.2), 4); st.focal = null; };
 
-      const st = S.current;
-      st.cur = st.cur || { x: 0, y: 0, zoom: 1 };
-      st.targetZoom = st.cur.zoom; st.focal = null; st.vel = { x: 0, y: 0 }; st.mode = null; st.dirty = true;
-      st.targetX = st.cur.x; st.targetY = st.cur.y; st.flying = false;
-      const apply = () => { camera.zoom = st.cur.zoom; camera.position.set(st.cur.x, st.cur.y, 10); camera.updateProjectionMatrix(); };
-      if (!st.initialized) {
-        if (initNode) { st.cur.zoom = 1.15; st.targetZoom = 1.15; st.cur.x = initNode.x + (W * 0.2) / 1.15; st.cur.y = -initNode.y; }
-        else { st.cur.x = (minX + maxX) / 2; st.cur.y = -(minY + maxY) / 2; }
-        st.initialized = true;
+    const loop = () => {
+      let moved = false;
+      if (Math.abs(st.cur.zoom - st.targetZoom) > 1e-4) {
+        st.cur.zoom += (st.targetZoom - st.cur.zoom) * 0.2; moved = true;
+        if (st.focal) { st.cur.x = st.focal.wx - st.focal.mx / st.cur.zoom; st.cur.y = st.focal.wy + st.focal.my / st.cur.zoom; }
+      } else { st.cur.zoom = st.targetZoom; st.focal = null; }
+      if (st.mode !== "pan" && (Math.abs(st.vel.x) > 0.02 || Math.abs(st.vel.y) > 0.02)) { st.cur.x -= st.vel.x; st.cur.y += st.vel.y; st.vel.x *= 0.9; st.vel.y *= 0.9; moved = true; }
+      if (st.fade < 1) {
+        st.fade = Math.min(1, st.fade + 0.14); moved = true;
+        for (const mm of nodeMeshes) mm.material.opacity = st.fade;
+        if (eMesh) eMesh.material.opacity = 0.95 * st.fade;
+        if (aMesh) aMesh.material.opacity = st.fade;
       }
-      apply();
-
-      // viewport culling: skip drawing nodes outside the camera view on large graphs
-      const CULL_MIN = 200;
-      const cull = () => {
-        const halfW = (W / 2) / st.cur.zoom + 48, halfH = (H / 2) / st.cur.zoom + 48;
-        for (const mm of nodeMeshes) {
-          const n = mm.userData.node;
-          mm.visible = Math.abs(n.x - st.cur.x) <= halfW + n._sz.w / 2 && Math.abs(-n.y - st.cur.y) <= halfH + n._sz.h / 2;
-        }
-      };
-      const loop = () => {
-        let moved = false;
-        if (Math.abs(st.cur.zoom - st.targetZoom) > 1e-4) {
-          st.cur.zoom += (st.targetZoom - st.cur.zoom) * 0.2; moved = true;
-          if (st.focal) { st.cur.x = st.focal.wx - st.focal.mx / st.cur.zoom; st.cur.y = st.focal.wy + st.focal.my / st.cur.zoom; }
-        } else { st.cur.zoom = st.targetZoom; st.focal = null; }
-        if (st.flying) {
-          st.cur.x += (st.targetX - st.cur.x) * 0.18; st.cur.y += (st.targetY - st.cur.y) * 0.18; moved = true;
-          if (Math.abs(st.targetX - st.cur.x) < 0.4 && Math.abs(st.targetY - st.cur.y) < 0.4 && Math.abs(st.cur.zoom - st.targetZoom) < 1e-3) st.flying = false;
-        }
-        if (!st.flying && st.mode !== "pan" && (Math.abs(st.vel.x) > 0.02 || Math.abs(st.vel.y) > 0.02)) { st.cur.x -= st.vel.x; st.cur.y += st.vel.y; st.vel.x *= 0.9; st.vel.y *= 0.9; moved = true; }
-        if ((moved || st.dirty) && nodes.length > CULL_MIN) cull();
-        if (moved || st.dirty) { apply(); renderer.render(scene, camera); st.dirty = false; }
-        raf = requestAnimationFrame(loop);
-      };
+      if (moved || st.dirty) { apply(); renderer.render(scene, camera); st.dirty = false; }
       raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
 
-      let lastX = 0, lastY = 0, isDown = false, movedAmt = 0, dragMesh = null;
-      const rc = new THREE.Raycaster();
-      const pick = (e) => {
-        const rect = renderer.domElement.getBoundingClientRect();
-        const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
-        rc.setFromCamera(ndc, camera);
-        return rc.intersectObjects(nodeMeshes)[0]?.object || null;
-      };
-      const onDown = (e) => { isDown = true; lastX = e.clientX; lastY = e.clientY; movedAmt = 0; st.vel = { x: 0, y: 0 }; st.flying = false; dragMesh = pick(e); st.mode = dragMesh ? "node" : "pan"; container.style.cursor = "grabbing"; };
-      const onMove = (e) => {
-        if (!isDown) return;
-        const dx = e.clientX - lastX, dy = e.clientY - lastY; movedAmt += Math.abs(dx) + Math.abs(dy);
-        if (st.mode === "node" && dragMesh) {
-          const n = dragMesh.userData.node;
-          n.x += dx / st.cur.zoom; n.y += dy / st.cur.zoom;
-          dragMesh.position.set(n.x, -n.y, 0);
-          manualPos.current.set(n.id, { x: n.x, y: n.y });
-          reroute(n.id);
-          patchEdges(incidence.get(n.id) || []);
-          st.dirty = true;
-        } else {
-          st.cur.x -= dx / st.cur.zoom; st.cur.y += dy / st.cur.zoom; st.vel = { x: dx / st.cur.zoom, y: dy / st.cur.zoom }; st.dirty = true;
-        }
-        lastX = e.clientX; lastY = e.clientY;
-      };
-      const onUp = () => {
-        if (isDown && movedAmt < 5) {
-          if (dragMesh) { const id = dragMesh.userData.nodeId; const cl = directFocus(id, adj); applyHighlight(cl); st.flyTo(cl.nodeSet); setSelected(id2.get(id)?.label || id); }
-          else { applyHighlight(null); setSelected(null); }
-        }
-        isDown = false; dragMesh = null; st.mode = null; container.style.cursor = "grab";
-      };
-      const onWheel = (e) => {
-        e.preventDefault();
-        st.flying = false;
-        const rect = container.getBoundingClientRect();
-        const mx = e.clientX - rect.left - rect.width / 2, my = e.clientY - rect.top - rect.height / 2;
-        st.focal = { mx, my, wx: st.cur.x + mx / st.cur.zoom, wy: st.cur.y - my / st.cur.zoom };
-        st.targetZoom = Math.min(Math.max(st.targetZoom * Math.exp(-e.deltaY * 0.0014), 0.12), 5);
-      };
-      container.style.cursor = "grab";
-      container.addEventListener("mousedown", onDown);
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-      container.addEventListener("wheel", onWheel, { passive: false });
-      cleanupInteraction = () => {
-        container.removeEventListener("mousedown", onDown);
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-        container.removeEventListener("wheel", onWheel);
-      };
+    let lastX = 0, lastY = 0, isDown = false, movedAmt = 0, dragMesh = null;
+    const rc = new THREE.Raycaster();
+    const pick = (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+      rc.setFromCamera(ndc, camera);
+      return rc.intersectObjects(nodeMeshes)[0]?.object || null;
+    };
+    const onDown = (e) => { isDown = true; lastX = e.clientX; lastY = e.clientY; movedAmt = 0; st.vel = { x: 0, y: 0 }; dragMesh = pick(e); st.mode = dragMesh ? "node" : "pan"; container.style.cursor = "grabbing"; };
+    const onMove = (e) => {
+      if (!isDown) return;
+      const dx = e.clientX - lastX, dy = e.clientY - lastY; movedAmt += Math.abs(dx) + Math.abs(dy);
+      if (st.mode === "node" && dragMesh) {
+        const n = dragMesh.userData.node;
+        n.x += dx / st.cur.zoom; n.y += dy / st.cur.zoom;
+        dragMesh.position.set(n.x, -n.y, n.isCenter ? 0.2 : 0);
+        rebuildEdges(); st.dirty = true;
+      } else {
+        st.cur.x -= dx / st.cur.zoom; st.cur.y += dy / st.cur.zoom; st.vel = { x: dx / st.cur.zoom, y: dy / st.cur.zoom }; st.dirty = true;
+      }
+      lastX = e.clientX; lastY = e.clientY;
+    };
+    const onUp = () => {
+      if (isDown && movedAmt < 5 && dragMesh) {
+        const navTo = dragMesh.userData.navTo;
+        if (navTo) navigateRef.current(navTo);
+      }
+      isDown = false; dragMesh = null; st.mode = null; container.style.cursor = "grab";
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      const mx = e.clientX - rect.left - rect.width / 2, my = e.clientY - rect.top - rect.height / 2;
+      st.focal = { mx, my, wx: st.cur.x + mx / st.cur.zoom, wy: st.cur.y - my / st.cur.zoom };
+      st.targetZoom = Math.min(Math.max(st.targetZoom * Math.exp(-e.deltaY * 0.0014), 0.2), 4);
+    };
+    container.style.cursor = "grab";
+    container.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    container.addEventListener("wheel", onWheel, { passive: false });
 
-      ro = new ResizeObserver(() => {
-        W = container.clientWidth; H = container.clientHeight;
-        camera.left = -W / 2; camera.right = W / 2; camera.top = H / 2; camera.bottom = -H / 2;
-        camera.updateProjectionMatrix(); renderer.setSize(W, H); st.dirty = true;
-      });
-      ro.observe(container);
+    ro = new ResizeObserver(() => {
+      W = container.clientWidth || W; H = container.clientHeight || H;
+      camera.left = -W / 2; camera.right = W / 2; camera.top = H / 2; camera.bottom = -H / 2;
+      camera.updateProjectionMatrix(); renderer.setSize(W, H); st.dirty = true;
+    });
+    ro.observe(container);
 
-      st.fit = () => { st.flying = false; const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.12; st.targetZoom = Math.min(W / (gw * p), H / (gh * p), 1.6); st.focal = null; st.cur.x = (minX + maxX) / 2; st.cur.y = -(minY + maxY) / 2; st.dirty = true; };
-      // smoothly pan to center on a set of node ids, keeping the current zoom level
-      st.flyTo = (set) => {
-        let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
-        for (const nid of set) { const n = id2.get(nid); if (!n) continue; mnx = Math.min(mnx, n.x - n._sz.w / 2); mxx = Math.max(mxx, n.x + n._sz.w / 2); mny = Math.min(mny, n.y - n._sz.h / 2); mxy = Math.max(mxy, n.y + n._sz.h / 2); }
-        if (!isFinite(mnx)) return;
-        st.targetX = (mnx + mxx) / 2; st.targetY = -(mny + mxy) / 2;
-        st.focal = null; st.vel = { x: 0, y: 0 }; st.flying = true; st.dirty = true;
-      };
-      st.focusStart = () => { if (!initNode) return st.fit(); st.flying = false; st.targetZoom = 1.15; st.focal = null; st.cur.x = initNode.x + (W * 0.2) / 1.15; st.cur.y = -initNode.y; st.dirty = true; };
-      st.zoomBy = (f) => { st.targetZoom = Math.min(Math.max(st.targetZoom * f, 0.12), 5); st.focal = null; };
-      st.clearSel = () => { applyHighlight(null); setSelected(null); };
-      st.resetPos = () => { manualPos.current = new Map(); setGraphData((g) => ({ ...g })); };
-      st.nodes = nodes; st.edges = edges; st.th = th; st.title = String(graphData.id || "state-machine");
-    })();
+    st.showCenter(centerRef.current || model.initial || model.order[0]);
 
     return () => {
-      cancelled = true;
       if (raf) cancelAnimationFrame(raf);
       if (ro) ro.disconnect();
-      if (cleanupInteraction) cleanupInteraction();
-      if (eGeoRef) eGeoRef.dispose(); if (aGeoRef) aGeoRef.dispose();
-      disposables.forEach((d) => d.dispose && d.dispose());
+      container.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      container.removeEventListener("wheel", onWheel);
+      clearFocus();
+      st.showCenter = null; st.recenter = null;
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
-  }, [graphData, themeName]); // eslint-disable-line
+  }, [model, themeName]); // eslint-disable-line
 
-  const applyJson = () => { try { setGraphData(JSON.parse(jsonText)); setEditorOpen(false); setSelected(null); } catch (err) { setErrors(["Invalid JSON: " + err.message]); } };
+  // swap focus content when the center changes (no renderer rebuild)
+  useEffect(() => { if (center != null) S.current.showCenter?.(center); }, [center]);
 
-  const u = th.ui;
-  const expBtn = (u, th, primary) => ({ flex: 1, padding: "9px 0", borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 12, border: `1px solid ${primary ? th.headerRed : u.border}`, background: primary ? th.headerRed : u.btn, color: primary ? "#fff" : u.btnText, fontFamily: FONT_STACK });
-  const Btn = ({ children, onClick }) => (
-    <button onClick={onClick} style={{ background: u.btn, color: u.btnText, border: `1px solid ${u.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, cursor: "pointer", fontFamily: FONT_STACK }}>{children}</button>
+  /* ----------------------------- export ----------------------------- */
+  const doExport = async (kind) => {
+    const s = S.current;
+    if (!s.nodes || !s.nodes.length) { notify("Nothing to export in this view."); return; }
+    setBusy(kind);
+    try {
+      const title = s.title || "state-machine";
+      const mk = (opts) => buildDiagramSVG(s.nodes, s.edges, s.th, opts);
+      if (kind === "svg") {
+        const { svg } = mk({ dpr: 4 });
+        downloadBlob(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), `${title}.svg`);
+      } else if (kind === "png" || kind === "jpeg") {
+        const { svg, width, height, bg } = mk({ dpr: 4 });
+        const mime = kind === "png" ? "image/png" : "image/jpeg";
+        const blob = await rasterize(svg, width, height, pngScale, mime, bg);
+        downloadBlob(blob, `${title}@${pngScale}x.${kind === "png" ? "png" : "jpg"}`);
+      } else if (kind === "pdf") {
+        const { svg, width, height } = mk({ dpr: 4 });
+        await exportPDF(svg, width, height, { paper, margin, title });
+      } else if (kind === "print") {
+        const { svg, width, height } = mk({ dpr: 4 });
+        if (!printDiagram(svg, width, height, { title })) notify("Pop-up blocked — allow pop-ups to print.");
+      }
+    } catch (err) {
+      if (kind === "pdf") notify("PDF needs jspdf + svg2pdf.js");
+      else notify("Export failed: " + (err?.message || err));
+      console.error(err);
+    } finally { setBusy(null); }
+  };
+
+  const applyJson = () => { try { setGraphData(JSON.parse(jsonText)); setEditorOpen(false); } catch (err) { notify("Invalid JSON: " + err.message); } };
+
+  /* ----------------------------- derived UI data -------------------- */
+  const q = search.trim().toLowerCase();
+  const matches = (s) => {
+    if (!q) return true;
+    if (s.id.toLowerCase().includes(q)) return true;
+    return [...s.out, ...s.in, ...s.globals].some((e) => String(e.event).toLowerCase().includes(q));
+  };
+  const grouped = GROUPS.map((g) => ({
+    ...g,
+    items: model.order.map((id) => model.states.get(id)).filter((s) => g.test(s) && matches(s)),
+  })).filter((g) => g.items.length);
+
+  const pathInit = centerState && model.initial ? shortestPath(model, model.initial, center) : null;
+  const pathEnd = centerState ? pathToNearestEnd(model, center) : null;
+
+  /* ----------------------------- styles ----------------------------- */
+  const SIDE_W = 244, PANEL_W = 312, TOP = 30, BAR_H2 = 36, HEAD = TOP + BAR_H2;
+  const Btn = ({ children, onClick, title }) => (
+    <button title={title} onClick={onClick} style={{ background: u.btn, color: u.btnText, border: `1px solid ${u.border}`, borderRadius: 6, padding: "5px 9px", fontSize: 12, cursor: "pointer", fontFamily: FONT_STACK }}>{children}</button>
   );
-  const Swatch = ({ c, label }) => (<div style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 11, height: 11, borderRadius: 3, background: c, display: "inline-block" }} /><span>{label}</span></div>);
+  const Pill = ({ children, tone }) => {
+    const c = tone === "ok" ? th.endOk : tone === "err" ? th.endErr : u.subt;
+    return <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 700, color: c, border: `1px solid ${c}`, borderRadius: 20, padding: "1px 8px" }}>{children}</span>;
+  };
+  const NodeRow = ({ id, sub, active, tone, onClick }) => (
+    <div onClick={onClick} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, padding: "5px 8px", borderRadius: 6, cursor: "pointer", background: active ? u.active : "transparent", color: u.text }}
+      onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = u.hover; }}
+      onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "transparent"; }}>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12.5, fontWeight: active ? 700 : 500 }}>{id}</span>
+      {sub && <span style={{ fontSize: 10.5, color: tone === "err" ? th.endErr : u.subt, flexShrink: 0 }}>{sub}</span>}
+    </div>
+  );
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100vh", background: th.bg, fontFamily: FONT_STACK, overflow: "hidden" }}>
-      <div style={{ height: 30, background: th.headerRed, color: "#fff", display: "flex", alignItems: "center", padding: "0 14px", fontSize: 12, fontWeight: 700, letterSpacing: 0.3 }}>STATE MACHINE ANALYZER v1.0.0</div>
+    <div style={{ position: "relative", width: "100%", height: "100vh", background: th.bg, fontFamily: FONT_STACK, overflow: "hidden", color: u.text }}>
+      {/* header */}
+      <div style={{ height: TOP, background: th.headerRed, color: "#fff", display: "flex", alignItems: "center", padding: "0 14px", fontSize: 12, fontWeight: 700, letterSpacing: 0.3 }}>
+        STATE MACHINE ANALYZER — EXPLORER · <span style={{ opacity: 0.85, marginLeft: 6 }}>{String(graphData.id || "untitled")}</span>
+      </div>
 
-      <div style={{ position: "absolute", top: 40, right: 12, zIndex: 5, display: "flex", gap: 6, alignItems: "center" }}>
-        <button onClick={() => setThemeName((t) => (t === "light" ? "dark" : "light"))}
-          style={{ background: u.btn, color: u.btnText, border: `1px solid ${u.border}`, borderRadius: 16, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontFamily: FONT_STACK }}>
-          {themeName === "light" ? "◐ Light" : "◑ Dark"}
-        </button>
-        <Btn onClick={() => setEditorOpen((o) => !o)}>Edit JSON</Btn>
-        <Btn onClick={() => setExportOpen((o) => !o)}>Export / Print</Btn>
-        <Btn onClick={() => S.current.focusStart?.()}>Start</Btn>
-        <Btn onClick={() => S.current.fit?.()}>Fit</Btn>
-        <Btn onClick={() => S.current.resetPos?.()}>Reset layout</Btn>
+      {/* breadcrumb / toolbar */}
+      <div style={{ position: "absolute", top: TOP, left: 0, right: 0, height: BAR_H2, background: u.panel, borderBottom: `1px solid ${u.border}`, display: "flex", alignItems: "center", gap: 8, padding: "0 10px", zIndex: 6 }}>
+        <Btn onClick={back} title="Back">←</Btn>
+        <Btn onClick={forward} title="Forward">→</Btn>
+        <Btn onClick={() => goTo(model.initial)} title="Jump to initial">⌂ Start</Btn>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, overflow: "hidden", flex: 1, fontSize: 12, color: u.subt }}>
+          {[...history.slice(-3), center].filter(Boolean).map((id, i, arr) => (
+            <React.Fragment key={id + i}>
+              {i > 0 && <span style={{ opacity: 0.5 }}>›</span>}
+              <span onClick={() => goTo(id)} style={{ cursor: "pointer", fontWeight: id === center ? 700 : 500, color: id === center ? th.edgeHi : u.subt, whiteSpace: "nowrap" }}>{id}</span>
+            </React.Fragment>
+          ))}
+        </div>
         <Btn onClick={() => S.current.zoomBy?.(1.2)}>+</Btn>
         <Btn onClick={() => S.current.zoomBy?.(0.8)}>−</Btn>
-        {selected && <Btn onClick={() => S.current.clearSel?.()}>Clear</Btn>}
+        <Btn onClick={() => S.current.recenter?.()} title="Re-fit">⤢</Btn>
+        <button onClick={() => setThemeName((t) => (t === "light" ? "dark" : "light"))} style={{ background: u.btn, color: u.btnText, border: `1px solid ${u.border}`, borderRadius: 16, padding: "5px 11px", fontSize: 12, cursor: "pointer", fontFamily: FONT_STACK }}>{themeName === "light" ? "◐" : "◑"}</button>
+        <Btn onClick={() => setEditorOpen((o) => !o)}>Edit JSON</Btn>
+        <Btn onClick={() => setExportOpen((o) => !o)}>Export</Btn>
       </div>
 
-      <div ref={mountRef} style={{ position: "absolute", top: 30, left: 0, right: 0, bottom: 0 }} />
-
-      {selected && (
-        <div style={{ position: "absolute", top: 80, right: 12, zIndex: 5, background: u.panel, border: `1px solid ${u.border}`, color: u.text, borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-          Next from <b style={{ color: th.edgeHi }}>{selected}</b>
+      {/* left sidebar: search + outline */}
+      <div style={{ position: "absolute", top: HEAD, left: 0, width: SIDE_W, bottom: 0, background: u.panel, borderRight: `1px solid ${u.border}`, display: "flex", flexDirection: "column", zIndex: 5 }}>
+        <div style={{ padding: 10, borderBottom: `1px solid ${u.border}` }}>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search states / events…"
+            style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: `1px solid ${u.border}`, background: u.editorBg, color: u.text, fontSize: 12.5, outline: "none", fontFamily: FONT_STACK }} />
+          <div style={{ marginTop: 7, fontSize: 11, color: u.subt }}>
+            {model.states.size} states · {model.globalsList.length} global handlers
+            {analysis.unreachable.length > 0 && <span style={{ color: th.endErr }}> · {analysis.unreachable.length} unreachable</span>}
+          </div>
         </div>
-      )}
-
-      <div style={{ position: "absolute", bottom: 12, right: 12, zIndex: 5, display: "flex", flexDirection: "column", gap: 5, background: u.panel, border: `1px solid ${u.border}`, borderRadius: 8, padding: "9px 12px", fontSize: 11, color: u.subt }}>
-        <Swatch c={th.initial} label="Initial" />
-        <Swatch c={th.endOk} label="End — OK (✓)" />
-        <Swatch c={th.endErr} label="End — KO / error (✕)" />
-        <Swatch c={th.forkBar} label="Fork / Join (drag to arrange)" />
-        <Swatch c={th.choiceAccent} label="Choice" />
-        <Swatch c={th.transFill} label="Transition" />
-        <Swatch c={th.bullet} label="MFE bullet (◉)" />
+        <div style={{ flex: 1, overflowY: "auto", padding: "6px 6px 14px" }}>
+          {grouped.map((g) => (
+            <div key={g.key} style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: 0.6, textTransform: "uppercase", color: u.subt, padding: "6px 8px 3px" }}>{g.label} · {g.items.length}</div>
+              {g.items.map((s) => {
+                const unreachable = analysis.unreachable.includes(s.id);
+                return <NodeRow key={s.id} id={s.id} active={s.id === center} tone={unreachable ? "err" : undefined}
+                  sub={unreachable ? "unreachable" : s.isEnd ? (s.endStatus === "error" ? "KO" : "OK") : undefined}
+                  onClick={() => goTo(s.id)} />;
+              })}
+            </div>
+          ))}
+          {!grouped.length && <div style={{ padding: 12, fontSize: 12, color: u.subt }}>No matches.</div>}
+        </div>
       </div>
 
-      {errors.length > 0 && (
-        <div style={{ position: "absolute", bottom: 12, left: 12, zIndex: 5, maxWidth: 420, background: "rgba(227,6,19,.12)", border: "1px solid rgba(227,6,19,.5)", color: "#c0202c", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
-          {errors.slice(0, 6).map((e, i) => <div key={i}>• {e}</div>)}
+      {/* center canvas */}
+      <div ref={mountRef} style={{ position: "absolute", top: HEAD, left: SIDE_W, right: PANEL_W, bottom: 0 }} />
+
+      {/* right analysis panel */}
+      <div style={{ position: "absolute", top: HEAD, right: 0, width: PANEL_W, bottom: 0, background: u.panel, borderLeft: `1px solid ${u.border}`, overflowY: "auto", zIndex: 5, fontSize: 12.5 }}>
+        {centerState ? (
+          <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 800, wordBreak: "break-word" }}>{centerState.id}</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 7 }}>
+                <Pill>{centerState.type}</Pill>
+                {centerState.isInitial && <Pill tone="ok">initial</Pill>}
+                {centerState.isEnd && <Pill tone={centerState.endStatus === "error" ? "err" : "ok"}>end · {centerState.endStatus === "error" ? "KO" : "OK"}</Pill>}
+                {centerState.hasBullet && <Pill>◉ MFE{centerState.bulletName ? ` · ${centerState.bulletName}` : ""}</Pill>}
+              </div>
+              {(centerState.productStatus || centerState.dossierStatus) && (
+                <div style={{ marginTop: 7, fontSize: 11.5, color: u.subt }}>
+                  {centerState.productStatus && <div>product: <b style={{ color: u.text }}>{centerState.productStatus}</b></div>}
+                  {centerState.dossierStatus && <div>dossier: <b style={{ color: u.text }}>{centerState.dossierStatus}</b></div>}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              <Pill tone={analysis.reachable.has(center) || !model.initial ? "ok" : "err"}>{analysis.reachable.has(center) || !model.initial ? "reachable ✓" : "unreachable ✕"}</Pill>
+              <Pill tone={analysis.canReachEnd.has(center) ? "ok" : "err"}>{analysis.canReachEnd.has(center) ? "reaches END ✓" : "no path to END ✕"}</Pill>
+            </div>
+
+            <Section title={`Outgoing · ${centerState.out.length}`} u={u}>
+              {centerState.out.length ? centerState.out.map((e, i) => (
+                <EventRow key={i} event={e.event} node={e.target} u={u} th={th} onClick={() => goTo(e.target)} />
+              )) : <Empty u={u}>no outgoing transitions{!centerState.isEnd ? " (dead-end)" : ""}</Empty>}
+            </Section>
+
+            <Section title={`Incoming · ${centerState.in.length}`} u={u}>
+              {centerState.in.length ? centerState.in.map((e, i) => (
+                <EventRow key={i} event={e.event} node={e.source} dir="from" u={u} th={th} onClick={() => goTo(e.source)} />
+              )) : <Empty u={u}>no incoming transitions</Empty>}
+            </Section>
+
+            <Section title={`Global handlers · ${centerState.globals.length}`} u={u}>
+              {centerState.globals.length ? centerState.globals.map((e, i) => (
+                <EventRow key={i} event={e.event} node={e.target} u={u} th={th} onClick={() => goTo(e.target)} />
+              )) : <Empty u={u}>none apply to this state</Empty>}
+            </Section>
+
+            <Section title="Path from initial" u={u}>
+              {pathInit ? <PathTrace path={pathInit} u={u} th={th} onGo={goTo} /> : <Empty u={u}>not reachable from initial</Empty>}
+            </Section>
+            <Section title="Path to nearest end" u={u}>
+              {pathEnd ? <PathTrace path={pathEnd} u={u} th={th} onGo={goTo} /> : <Empty u={u}>cannot reach any end state</Empty>}
+            </Section>
+          </div>
+        ) : <div style={{ padding: 16, color: u.subt }}>No state selected.</div>}
+      </div>
+
+      {model.errors.length > 0 && (
+        <div style={{ position: "absolute", bottom: 12, left: SIDE_W + 12, zIndex: 7, maxWidth: 420, background: "rgba(227,6,19,.12)", border: "1px solid rgba(227,6,19,.5)", color: "#c0202c", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
+          {model.errors.slice(0, 6).map((e, i) => <div key={i}>• {e}</div>)}
         </div>
       )}
 
       {toast && (
-        <div style={{ position: "absolute", bottom: 70, left: "50%", transform: "translateX(-50%)", zIndex: 8, background: "#1c1f24", color: "#fff", padding: "10px 16px", borderRadius: 8, fontSize: 12, boxShadow: "0 6px 24px rgba(0,0,0,.4)", maxWidth: 460, textAlign: "center" }}>{toast}</div>
+        <div style={{ position: "absolute", bottom: 70, left: "50%", transform: "translateX(-50%)", zIndex: 9, background: "#1c1f24", color: "#fff", padding: "10px 16px", borderRadius: 8, fontSize: 12, boxShadow: "0 6px 24px rgba(0,0,0,.4)", maxWidth: 460, textAlign: "center" }}>{toast}</div>
       )}
 
       {exportOpen && (
-        <div style={{ position: "absolute", top: 80, right: 12, zIndex: 7, width: 300, background: u.panel, border: `1px solid ${u.border}`, borderRadius: 10, boxShadow: "0 10px 40px rgba(0,0,0,.35)", color: u.text, fontSize: 13, overflow: "hidden" }}>
+        <div style={{ position: "absolute", top: HEAD + 6, right: PANEL_W + 8, zIndex: 8, width: 300, background: u.panel, border: `1px solid ${u.border}`, borderRadius: 10, boxShadow: "0 10px 40px rgba(0,0,0,.35)", color: u.text, fontSize: 13, overflow: "hidden" }}>
           <div style={{ padding: "11px 14px", fontWeight: 700, borderBottom: `1px solid ${u.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span>Export &amp; Print</span>
+            <span>Export current view</span>
             <span onClick={() => setExportOpen(false)} style={{ cursor: "pointer", color: u.subt }}>✕</span>
           </div>
           <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 14 }}>
@@ -917,15 +1029,13 @@ export default function WorkflowGraphWebGL() {
                 <button disabled={busy} onClick={() => doExport("print")} style={expBtn(u, th)}>Print</button>
               </div>
             </div>
-            <div style={{ color: u.subt, fontSize: 11, lineHeight: 1.5 }}>
-              Orientation &amp; scale are chosen automatically to best fit the page. PDF is true vector (needs <code>jspdf</code> + <code>svg2pdf.js</code>).
-            </div>
+            <div style={{ color: u.subt, fontSize: 11, lineHeight: 1.5 }}>Exports the currently focused neighborhood.</div>
           </div>
         </div>
       )}
 
       {editorOpen && (
-        <div style={{ position: "absolute", top: 40, left: 12, zIndex: 6, width: 380, bottom: 12, background: u.panel, border: `1px solid ${u.border}`, borderRadius: 10, display: "flex", flexDirection: "column", boxShadow: "0 8px 40px rgba(0,0,0,.35)" }}>
+        <div style={{ position: "absolute", top: HEAD + 6, left: SIDE_W + 8, zIndex: 8, width: 400, bottom: 12, background: u.panel, border: `1px solid ${u.border}`, borderRadius: 10, display: "flex", flexDirection: "column", boxShadow: "0 8px 40px rgba(0,0,0,.35)" }}>
           <div style={{ padding: "10px 12px", color: u.text, fontSize: 12, fontWeight: 700, borderBottom: `1px solid ${u.border}` }}>Workflow JSON</div>
           <textarea value={jsonText} onChange={(e) => setJsonText(e.target.value)} spellCheck={false}
             style={{ flex: 1, resize: "none", background: u.editorBg, color: u.editorText, border: "none", outline: "none", padding: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 }} />
@@ -935,6 +1045,42 @@ export default function WorkflowGraphWebGL() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* small presentational helpers */
+function expBtn(u, th, primary) {
+  return { flex: 1, padding: "9px 0", borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 12, border: `1px solid ${primary ? th.headerRed : u.border}`, background: primary ? th.headerRed : u.btn, color: primary ? "#fff" : u.btnText, fontFamily: FONT_STACK };
+}
+function Section({ title, children, u }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: 0.6, textTransform: "uppercase", color: u.subt, marginBottom: 5 }}>{title}</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>{children}</div>
+    </div>
+  );
+}
+function Empty({ children, u }) { return <div style={{ fontSize: 11.5, color: u.subt, fontStyle: "italic", padding: "2px 0" }}>{children}</div>; }
+function EventRow({ event, node, dir, u, th, onClick }) {
+  return (
+    <div onClick={onClick} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "5px 8px", borderRadius: 6, cursor: "pointer", background: u.editorBg, border: `1px solid ${u.border}` }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = u.hover)}
+      onMouseLeave={(e) => (e.currentTarget.style.background = u.editorBg)}>
+      <span style={{ fontSize: 11.5, fontWeight: 700, color: th.edgeHi, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{event}</span>
+      <span style={{ fontSize: 11.5, color: u.subt, flexShrink: 0 }}>{dir === "from" ? "← " : "→ "}{node}</span>
+    </div>
+  );
+}
+function PathTrace({ path, u, th, onGo }) {
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 4, fontSize: 11.5 }}>
+      {path.map((step, i) => (
+        <React.Fragment key={i}>
+          {i > 0 && <span style={{ color: u.subt }} title={step.event || ""}>·{step.event ? ` ${step.event} ` : " "}›</span>}
+          <span onClick={() => onGo(step.state)} style={{ cursor: "pointer", fontWeight: 600, color: th.edgeHi }}>{step.state}</span>
+        </React.Fragment>
+      ))}
     </div>
   );
 }
