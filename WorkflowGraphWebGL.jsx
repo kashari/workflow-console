@@ -48,6 +48,7 @@ const FONT_FORK = `700 11px ${FONT_STACK}`;
 const NODE_H = 46, PAD_X = 14, GAP = 10, BADGE_PAD = 8, MAX_LABEL_W = 152;
 const BAR_W = 18, BAR_H = 58, DIA = 44;
 const GAPX = 72, ROWGAP = 26; // focus-view layout spacing
+const MAXSIDE = 60; // cap drawn neighbors per side (full list still in the panel)
 
 /* --------------------------- SAMPLE JSON --------------------------- */
 const SAMPLE = {
@@ -117,23 +118,26 @@ function buildModel(wf) {
       endStatus: endSet.has(s.id) ? endNature(s.id, s) : null,
       hasBullet: !!s.microfrontendBullet, bulletName: s.bulletName || null,
       productStatus: s.productStatus || null, dossierStatus: s.dossierStatus || null,
-      out: [], in: [], globals: [],
+      out: [], in: [],
     });
   }
   const order = [...states.keys()];
-  const add = (source, target, event, kind) => {
+  // A common transition IS an outgoing edge of each source (so the source shows
+  // it), but it must NOT become an incoming edge on the target — otherwise a
+  // commonTransition with 40+ sources explodes the target into 40 predecessors.
+  const add = (source, target, event, global) => {
     const okS = states.has(source), okT = states.has(target);
     if (!okS) errors.push(`Unknown source "${source}" (event ${event}) — skipped`);
     if (!okT) errors.push(`Unknown target "${target}" (event ${event}) — skipped`);
     if (!okS || !okT) return;
-    if (kind === "global") states.get(source).globals.push({ event, target });
-    else { states.get(source).out.push({ event, target }); states.get(target).in.push({ event, source }); }
+    states.get(source).out.push({ event, target, global });
+    if (!global) states.get(target).in.push({ event, source });
   };
-  for (const t of wf.transitions || []) add(t.source, t.target, t.event, "normal");
+  for (const t of wf.transitions || []) add(t.source, t.target, t.event, false);
   const globalsList = [];
   for (const ct of wf.commonTransitions || []) {
     globalsList.push({ event: ct.event, target: ct.target, sourceList: [...(ct.sourceList || [])] });
-    for (const s of ct.sourceList || []) add(s, ct.target, ct.event, "global");
+    for (const s of ct.sourceList || []) add(s, ct.target, ct.event, true);
   }
   if (wf.initialState && !states.has(wf.initialState)) errors.push(`initialState "${wf.initialState}" is not a defined state`);
   return { states, order, initial: wf.initialState, endStates: [...endSet], globalsList, errors };
@@ -144,7 +148,7 @@ function analyze(model) {
   const { states, initial, endStates } = model;
   const fwd = new Map(), rev = new Map();
   for (const id of states.keys()) { fwd.set(id, []); rev.set(id, []); }
-  for (const [id, s] of states) for (const e of [...s.out, ...s.globals]) {
+  for (const [id, s] of states) for (const e of s.out) {
     if (!states.has(e.target)) continue;
     fwd.get(id).push(e.target); rev.get(e.target).push(id);
   }
@@ -159,7 +163,7 @@ function analyze(model) {
   for (const [id, s] of states) {
     if (initial && !reachable.has(id)) unreachable.push(id);
     if (!canReachEnd.has(id)) cannotReachEnd.push(id);
-    if (!s.isEnd && s.out.length === 0 && s.globals.length === 0) deadEnds.push(id);
+    if (!s.isEnd && s.out.length === 0) deadEnds.push(id);
   }
   return { reachable, canReachEnd, unreachable, cannotReachEnd, deadEnds };
 }
@@ -172,7 +176,7 @@ function shortestPath(model, from, to) {
   const prev = new Map(), seen = new Set([from]); let q = [from], done = false;
   while (q.length && !done) {
     const c = q.shift(), s = states.get(c);
-    for (const e of [...s.out, ...s.globals]) if (!seen.has(e.target) && states.has(e.target)) {
+    for (const e of s.out) if (!seen.has(e.target) && states.has(e.target)) {
       seen.add(e.target); prev.set(e.target, { from: c, event: e.event });
       if (e.target === to) { done = true; break; }
       q.push(e.target);
@@ -189,7 +193,7 @@ function pathToNearestEnd(model, from) {
   const prev = new Map(), seen = new Set([from]); let q = [from], found = null;
   while (q.length && !found) {
     const c = q.shift(), s = model.states.get(c); if (!s) continue;
-    for (const e of [...s.out, ...s.globals]) if (!seen.has(e.target) && model.states.has(e.target)) {
+    for (const e of s.out) if (!seen.has(e.target) && model.states.has(e.target)) {
       seen.add(e.target); prev.set(e.target, { from: c, event: e.event });
       if (ends.has(e.target)) { found = e.target; break; }
       q.push(e.target);
@@ -220,18 +224,15 @@ function buildFocusView(model, centerId, m) {
   if (!center) return { nodes: [], edges: [] };
   const cNode = stateNode(center); cNode.isCenter = true; cNode._sz = nodeSize(cNode, m);
 
-  const succ = center.out.map((e, i) => {
-    const ev = eventNode(`succ-ev-${i}`, e.event); ev._sz = nodeSize(ev, m); ev.navTo = e.target;
-    const stN = stateNode(model.states.get(e.target) || { id: e.target, badge: "?", cat: "simple" });
-    stN.id = `succ-st-${i}`; stN.navTo = e.target; stN._sz = nodeSize(stN, m);
+  const mkRow = (e, i, kind) => {
+    const otherId = kind === "succ" ? e.target : e.source;
+    const ev = eventNode(`${kind}-ev-${i}`, e.event); ev._sz = nodeSize(ev, m); ev.navTo = otherId; ev.global = !!e.global;
+    const src = model.states.get(otherId) || { id: otherId, badge: "?", cat: "simple" };
+    const stN = stateNode(src); stN.id = `${kind}-st-${i}`; stN.navTo = otherId; stN._sz = nodeSize(stN, m); stN.global = !!e.global;
     return { ev, st: stN };
-  });
-  const pred = center.in.map((e, j) => {
-    const ev = eventNode(`pred-ev-${j}`, e.event); ev._sz = nodeSize(ev, m); ev.navTo = e.source;
-    const stN = stateNode(model.states.get(e.source) || { id: e.source, badge: "?", cat: "simple" });
-    stN.id = `pred-st-${j}`; stN.navTo = e.source; stN._sz = nodeSize(stN, m);
-    return { ev, st: stN };
-  });
+  };
+  const succ = center.out.slice(0, MAXSIDE).map((e, i) => mkRow(e, i, "succ"));
+  const pred = center.in.slice(0, MAXSIDE).map((e, i) => mkRow(e, i, "pred"));
 
   const maxW = (arr, k) => arr.reduce((mx, r) => Math.max(mx, r[k]._sz.w), 0);
   const wSuccEv = maxW(succ, "ev"), wSuccSt = maxW(succ, "st");
@@ -710,11 +711,12 @@ export default function WorkflowGraphWebGL() {
       }
       buildEdges();
       if (!isFinite(minX)) { minX = -100; maxX = 100; minY = -100; maxY = 100; }
-      const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.3;
-      st.targetZoom = Math.min(Math.max(Math.min(W / (gw * p), H / (gh * p)), 0.4), 1.7);
-      st.cur.zoom = st.targetZoom; st.focal = null; st.flying = false;
+      // clamp zoom to a readable range; tall neighborhoods overflow and pan
+      const gw = maxX - minX || 1, gh = maxY - minY || 1, p = 1.2;
+      st.targetZoom = Math.min(Math.max(Math.min(W / (gw * p), H / (gh * p)), 0.7), 1.6);
+      st.focal = null; st.flying = false;
       st.cur.x = (minX + maxX) / 2; st.targetX = st.cur.x;
-      st.cur.y = -(minY + maxY) / 2; st.targetY = st.cur.y;
+      st.cur.y = 0; st.targetY = 0; // keep the center node vertically centered; tall lists pan
       st.fade = 0;
       st.nodes = curNodes; st.edges = curEdges; st.th = th; st.title = String(graphData.id || "state-machine");
       st.dirty = true;
@@ -845,7 +847,7 @@ export default function WorkflowGraphWebGL() {
   const matches = (s) => {
     if (!q) return true;
     if (s.id.toLowerCase().includes(q)) return true;
-    return [...s.out, ...s.in, ...s.globals].some((e) => String(e.event).toLowerCase().includes(q));
+    return [...s.out, ...s.in].some((e) => String(e.event).toLowerCase().includes(q));
   };
   const grouped = GROUPS.map((g) => ({
     ...g,
@@ -854,6 +856,7 @@ export default function WorkflowGraphWebGL() {
 
   const pathInit = centerState && model.initial ? shortestPath(model, model.initial, center) : null;
   const pathEnd = centerState ? pathToNearestEnd(model, center) : null;
+  const globalInto = center ? model.globalsList.filter((g) => g.target === center) : [];
 
   /* ----------------------------- styles ----------------------------- */
   const SIDE_W = 244, PANEL_W = 312, TOP = 30, BAR_H2 = 36, HEAD = TOP + BAR_H2;
@@ -957,7 +960,7 @@ export default function WorkflowGraphWebGL() {
 
             <Section title={`Outgoing · ${centerState.out.length}`} u={u}>
               {centerState.out.length ? centerState.out.map((e, i) => (
-                <EventRow key={i} event={e.event} node={e.target} u={u} th={th} onClick={() => goTo(e.target)} />
+                <EventRow key={i} event={e.event} node={e.target} note={e.global ? "global" : undefined} u={u} th={th} onClick={() => goTo(e.target)} />
               )) : <Empty u={u}>no outgoing transitions{!centerState.isEnd ? " (dead-end)" : ""}</Empty>}
             </Section>
 
@@ -967,11 +970,16 @@ export default function WorkflowGraphWebGL() {
               )) : <Empty u={u}>no incoming transitions</Empty>}
             </Section>
 
-            <Section title={`Global handlers · ${centerState.globals.length}`} u={u}>
-              {centerState.globals.length ? centerState.globals.map((e, i) => (
-                <EventRow key={i} event={e.event} node={e.target} u={u} th={th} onClick={() => goTo(e.target)} />
-              )) : <Empty u={u}>none apply to this state</Empty>}
-            </Section>
+            {globalInto.length > 0 && (
+              <Section title={`Reached by global handler · ${globalInto.length}`} u={u}>
+                {globalInto.map((g, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "5px 8px", borderRadius: 6, background: u.editorBg, border: `1px solid ${u.border}` }}>
+                    <span style={{ fontSize: 11.5, fontWeight: 700, color: th.edgeHi, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.event}</span>
+                    <span style={{ fontSize: 11.5, color: u.subt, flexShrink: 0 }}>from {g.sourceList.length} states</span>
+                  </div>
+                ))}
+              </Section>
+            )}
 
             <Section title="Path from initial" u={u}>
               {pathInit ? <PathTrace path={pathInit} u={u} th={th} onGo={goTo} /> : <Empty u={u}>not reachable from initial</Empty>}
@@ -1062,12 +1070,15 @@ function Section({ title, children, u }) {
   );
 }
 function Empty({ children, u }) { return <div style={{ fontSize: 11.5, color: u.subt, fontStyle: "italic", padding: "2px 0" }}>{children}</div>; }
-function EventRow({ event, node, dir, u, th, onClick }) {
+function EventRow({ event, node, dir, note, u, th, onClick }) {
   return (
     <div onClick={onClick} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "5px 8px", borderRadius: 6, cursor: "pointer", background: u.editorBg, border: `1px solid ${u.border}` }}
       onMouseEnter={(e) => (e.currentTarget.style.background = u.hover)}
       onMouseLeave={(e) => (e.currentTarget.style.background = u.editorBg)}>
-      <span style={{ fontSize: 11.5, fontWeight: 700, color: th.edgeHi, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{event}</span>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <span style={{ fontSize: 11.5, fontWeight: 700, color: th.edgeHi }}>{event}</span>
+        {note && <span style={{ fontSize: 10.5, color: u.subt, fontWeight: 600 }}> · {note}</span>}
+      </span>
       <span style={{ fontSize: 11.5, color: u.subt, flexShrink: 0 }}>{dir === "from" ? "← " : "→ "}{node}</span>
     </div>
   );
